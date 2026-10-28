@@ -6,8 +6,8 @@ status line, `usage_hooks/usage_statusline.py` (at the repo root before v0.32). 
 ## Branches
 
 - `ks-main`: upstream tag `v0.34.7` plus the changes below. It is the default branch, and we install from it.
-- `main`: an untouched copy of upstream `main` from fork time (2026-10-27). It has not been reviewed, so never
-  install from it.
+- `upstream-main`: an untouched copy of upstream `main` from fork time (2026-10-27), renamed from `main` so it
+  isn't mistaken for ours. It has not been reviewed, so never install from it.
 
 ## What we changed
 
