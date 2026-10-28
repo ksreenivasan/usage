@@ -34,6 +34,10 @@ from this repo at a pinned commit, checks its sha256, copies it to `~/.claude/us
 install -m 0755 usage_statusline.py ~/.claude/usage-statusline.py
 ```
 
+Don't install upstream's menu bar app, and don't run upstream `usage-cli`, on a host that uses this status line.
+Each run of either repeats setup if `statusLine` is missing. If the installed script's version differs from its
+own, it silently overwrites `~/.claude/usage-statusline.py` with upstream's copy.
+
 ## Pulling changes from upstream
 
 Upstream releases often, several times a day at times. Pull only what you have reviewed.
