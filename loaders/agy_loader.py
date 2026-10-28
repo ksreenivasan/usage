@@ -28,7 +28,7 @@ from loaders.disk_cache_lifecycle import (
 from loaders.disk_cache_lifecycle import (
     flush_caches_on_terminate as _flush_caches_on_terminate,
 )
-from project_resolver import resolve_project_name
+from usage_common.project_resolver import resolve_project_name
 
 logger = logging.getLogger(__name__)
 
@@ -174,11 +174,6 @@ def _flush_caches_to_disk(*, force: bool = False) -> None:
 def flush_caches_on_terminate() -> None:
     """Best-effort persistence of cache changes still waiting for the throttle."""
     _flush_caches_on_terminate(lambda: _flush_caches_to_disk(force=True))
-
-
-def recent_input_output_tokens(hours_back: int) -> int:
-    """Return recent input plus output tokens, excluding cache-read and thinking."""
-    return sum(entry.input_tokens + entry.output_tokens for entry in load_entries(hours_back))
 
 
 def _load_database(

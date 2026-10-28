@@ -11,21 +11,29 @@ from typing import Literal
 type MenuSurface = Literal["panel", "tray"]
 type CheckKey = Literal[
     "active_panel",
+    "tray_provider",
+    "quota_label",
     "hide_claude",
     "hide_codex",
     "hide_agy",
     "hide_grok",
+    "hide_muse",
     "launch_at_login",
     "quota_notifications",
     "window_keeper",
     "session_resume",
     "terse_mode",
+    "claude_pane",
+    "claude_beginner",
+    "quota_aware",
+    "statusline",
 ]
 
 PANEL: MenuSurface = "panel"
 TRAY: MenuSurface = "tray"
 _PANEL_ONLY = frozenset({PANEL})
 _TRAY_ONLY = frozenset({TRAY})
+_BOTH = frozenset({PANEL, TRAY})
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +65,18 @@ type Panel = tuple[str, str, str]
 
 def windows_menu_model(panels: tuple[Panel, ...]) -> tuple[MenuEntry, ...]:
     """Describe both Windows menus once; renderers select their own surface."""
+    tray_providers: tuple[MenuEntry, ...] = tuple(
+        MenuCommand(
+            f"{provider}_name",
+            "set_tray_provider",
+            surfaces=_BOTH,
+            checked_by="tray_provider",
+            argument_name="provider",
+            argument_value=provider,
+            radio=True,
+        )
+        for provider in ("claude", "codex")
+    )
     panel_choices: tuple[MenuEntry, ...] = tuple(
         MenuCommand(
             i18n_key,
@@ -97,12 +117,23 @@ def windows_menu_model(panels: tuple[Panel, ...]) -> tuple[MenuEntry, ...]:
             argument_name="preferenceKey",
             argument_value="hide_grok_section",
         ),
+        MenuCommand(
+            "muse_name",
+            "toggle_hide_section",
+            checked_by="hide_muse",
+            argument_name="preferenceKey",
+            argument_value="hide_muse_section",
+        ),
     )
     return (
         MenuCommand("panel_ai_daily", "open_ai_daily"),
         MenuSeparator(_PANEL_ONLY),
         MenuGroup("switch_panel", panel_choices),
         MenuGroup("hide_sections_menu", hidden_sections),
+        MenuGroup("tray_provider_menu", tray_providers, surfaces=_BOTH),
+        MenuCommand(
+            "quota_label_menu", "toggle_quota_label", surfaces=_BOTH, checked_by="quota_label"
+        ),
         MenuSeparator(_PANEL_ONLY),
         MenuCommand("launch_at_login", "toggle_login", checked_by="launch_at_login"),
         MenuCommand(
@@ -115,6 +146,21 @@ def windows_menu_model(panels: tuple[Panel, ...]) -> tuple[MenuEntry, ...]:
         # added a divider with no real category difference (matches macOS f74bbe0).
         MenuCommand("project_butler", "toggle_session_resume", checked_by="session_resume"),
         MenuCommand("terse_mode_menu", "toggle_terse_mode", checked_by="terse_mode"),
+        MenuGroup(
+            "claude_code_section",
+            (
+                MenuCommand("statusline_sync_menu", "toggle_statusline", checked_by="statusline"),
+                MenuCommand(
+                    "claude_pane_section_menu", "toggle_claude_pane", checked_by="claude_pane"
+                ),
+                MenuCommand(
+                    "claude_beginner_menu",
+                    "toggle_claude_beginner",
+                    checked_by="claude_beginner",
+                ),
+                MenuCommand("quota_aware_menu", "toggle_quota_aware", checked_by="quota_aware"),
+            ),
+        ),
         MenuSeparator(_PANEL_ONLY),
         MenuCommand("check_update", "check_update"),
         MenuCommand(

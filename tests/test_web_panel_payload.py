@@ -10,7 +10,6 @@ from typing import cast
 
 import pytest
 
-import prefs
 from loaders.agy_quota_probe import AgyQuotaGroup, AgyQuotaResult, AgyQuotaWindow
 from loaders.grok_quota_probe import GrokQuotaResult
 from menubar import agy as menubar_agy
@@ -18,9 +17,10 @@ from menubar import app as menubar
 from menubar import grok as menubar_grok
 from panels.web_panel import UsageScriptBridge, _row_payload, _state_payload
 from quota.burn_rate import BurnRateTracker
+from usage_common import prefs
 
 
-def test_state_payload_includes_agy_card_data() -> None:
+def test_state_payload_includes_agy_card_data(monkeypatch: pytest.MonkeyPatch) -> None:
     quota = AgyQuotaResult(
         groups=[
             AgyQuotaGroup(
@@ -40,12 +40,14 @@ def test_state_payload_includes_agy_card_data() -> None:
         ],
         fetched_at="2026-01-01T00:00:00+00:00",
     )
+    monkeypatch.setattr(menubar_agy, "_last_quota", quota)
     projection = menubar_agy.project_quota(quota, "en", now=1_767_225_600.0)
     assert projection is not None
     state = menubar._empty_state("en")
     state.agy_session = projection.session
     state.agy_weekly = projection.weekly
     state.agy_group_name = projection.group_name
+    state.agy_group_switchable = projection.group_switchable
     state.agy_stale = projection.stale
     state.hide_agy = False
 
@@ -53,14 +55,15 @@ def test_state_payload_includes_agy_card_data() -> None:
 
     assert payload["hideAgy"] is False
     assert payload["hideGrok"] is True
-    assert payload["cardOrder"] == ["claude", "codex", "agy", "grok"]
+    assert payload["cardOrder"] == ["claude", "codex", "agy", "grok", "muse"]
     assert payload["projectsYesterday"] == []
     footer = cast(dict[str, object], payload["footer"])
-    assert footer["yesterday"] == "Yesterday: $0.00 (0 tokens)"
+    assert footer["yesterday"] == {"tokensText": "0", "costText": "$0.00"}
     assert payload["agy"] == {
         "session": {
             "percent": 25.0,
             "percentText": "25% used",
+            "percentTextCompact": "25%",
             "resetText": "Resets in 1h 0m",
             "resetTextCompact": "Resets in 1h 0m",
             "warning": False,
@@ -70,6 +73,7 @@ def test_state_payload_includes_agy_card_data() -> None:
         "weekly": {
             "percent": 50.0,
             "percentText": "50% used",
+            "percentTextCompact": "50%",
             "resetText": "Resets in 1d 0h",
             "resetTextCompact": "Resets in 1d 0h",
             "warning": False,
@@ -77,6 +81,9 @@ def test_state_payload_includes_agy_card_data() -> None:
             "title": "Weekly",
         },
         "groupName": "GEMINI MODELS",
+        "groupSwitchable": False,
+        "availableGroups": ["gemini"],
+        "weeklyOnly": False,
         "stale": None,
     }
     grok_payload = cast(dict[str, object], payload["grok"])
@@ -111,6 +118,7 @@ def test_state_payload_includes_available_grok_card_data() -> None:
     assert grok_weekly.keys() == {
         "percent",
         "percentText",
+        "percentTextCompact",
         "resetText",
         "resetTextCompact",
         "warning",
@@ -165,7 +173,13 @@ def test_bridge_saves_valid_card_order_and_ignores_invalid_input(
         ),
     )
 
-    assert prefs._load_preferences()["quota_card_order"] == ["agy", "claude", "codex", "grok"]
+    assert prefs._load_preferences()["quota_card_order"] == [
+        "agy",
+        "claude",
+        "codex",
+        "grok",
+        "muse",
+    ]
 
     bridge.userContentController_didReceiveScriptMessage_(
         None,
@@ -174,7 +188,13 @@ def test_bridge_saves_valid_card_order_and_ignores_invalid_input(
         ),
     )
 
-    assert prefs._load_preferences()["quota_card_order"] == ["agy", "claude", "codex", "grok"]
+    assert prefs._load_preferences()["quota_card_order"] == [
+        "agy",
+        "claude",
+        "codex",
+        "grok",
+        "muse",
+    ]
 
 
 def test_bridge_saves_valid_panel_flavor_and_ignores_invalid_input(
@@ -231,6 +251,7 @@ def test_bridge_switches_agy_from_cached_quota(
     assert painted == [state]
     agy_payload = cast(dict[str, object], _state_payload(state)["agy"])
     assert agy_payload["groupName"] == "CLAUDE AND GPT MODELS"
+    assert agy_payload["groupSwitchable"] is True
 
     bridge.userContentController_didReceiveScriptMessage_(
         None,
@@ -272,3 +293,62 @@ def test_bridge_forwards_window_drag() -> None:
     )
 
     assert calls == [web_view]
+
+
+def test_reset_row_payload_uses_display_value() -> None:
+    row = menubar._quota_row("Weekly", 100.0, 999.0, 1000.0, menubar.CLAUDE_COLOR)
+    payload = _row_payload(row)
+    assert payload["percent"] == 0.0
+    assert payload["percentText"] == "0% used"
+    assert payload["resetText"] == payload["resetTextCompact"] == "Reset"
+    assert payload["warning"] is False
+    assert row.percent == 100.0
+
+
+@pytest.mark.parametrize("include_gemini", [False, True])
+def test_shared_payload_lists_available_agy_groups(
+    monkeypatch: pytest.MonkeyPatch, include_gemini: bool
+) -> None:
+    names = ["CLAUDE AND GPT MODELS", "GEMINI 4 ARGON"]
+    expected = ["claude_gpt", "argon"]
+    if include_gemini:
+        names.insert(0, "GEMINI MODELS")
+        expected.insert(0, "gemini")
+    quota = AgyQuotaResult(
+        [AgyQuotaGroup(name, [], None, None) for name in reversed(names)],
+        datetime.now(UTC).isoformat(),
+    )
+    monkeypatch.setattr(menubar_agy, "_last_quota", quota)
+    agy = cast(dict[str, object], _state_payload(menubar._empty_state("en"))["agy"])
+    assert agy["availableGroups"] == expected
+
+
+def test_bridge_switch_updates_argon_weekly_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(prefs, "PREFERENCES_FILE", tmp_path / "preferences.json")
+    window = AgyQuotaWindow(75, "60m", 60)
+    quota = AgyQuotaResult(
+        [
+            AgyQuotaGroup("GEMINI MODELS", [], window, window),
+            AgyQuotaGroup("GEMINI 4 ARGON", [], window, None),
+        ],
+        datetime.now(UTC).isoformat(),
+    )
+    monkeypatch.setattr(menubar_agy, "_last_quota", quota)
+    state = menubar._empty_state("en")
+    bridge = UsageScriptBridge.alloc().init()
+    bridge.delegate = SimpleNamespace(
+        latest_state=state,
+        burn_rate_trackers={"agy_session": BurnRateTracker(), "agy_weekly": BurnRateTracker()},
+        popover_controller=SimpleNamespace(setState_=lambda _state: None),
+    )
+    for group, expected in [("argon", True), ("gemini", False)]:
+        bridge.userContentController_didReceiveScriptMessage_(
+            None,
+            SimpleNamespace(
+                body=lambda group=group: '{"action":"set_agy_quota_group","group":"' + group + '"}'
+            ),
+        )
+        assert state.agy_weekly_only is expected
+        assert cast(dict[str, object], _state_payload(state)["agy"])["weeklyOnly"] is expected

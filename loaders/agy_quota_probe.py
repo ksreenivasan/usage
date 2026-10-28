@@ -4,12 +4,13 @@
 # Part of "usage". Free software licensed under the GNU Affero General Public
 # License v3.0 only; see the LICENSE file for full terms and the warranty disclaimer.
 
-"""Fetch Antigravity quota straight from the official Cloud Code quota API.
+"""Fetch Antigravity quota from the Antigravity CLI, or the official Cloud Code quota API.
 
-Reads the OAuth token that the Antigravity CLI stores in the platform credential
-store (with its legacy token file as fallback), refreshes it through Google's
-token endpoint when stale, then POSTs the internal ``retrieveUserQuotaSummary``
-endpoint for the quota summary. No CLI is spawned, no screen text is parsed.
+First runs ``agy -p /usage --output-format json``, which returns every quota group
+as JSON without a model call. When that fails, reads the OAuth token that the
+Antigravity CLI stores in the platform credential store (with its legacy token file
+as fallback), refreshes it through Google's token endpoint when stale, then POSTs
+the internal ``retrieveUserQuotaSummary`` endpoint for the quota summary.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ import urllib.parse
 from base64 import b64decode
 from binascii import Error as Base64Error
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -37,6 +38,20 @@ from urllib.request import Request, urlopen
 from usage_common.subprocess_utils import hidden_console_kwargs
 
 CACHE_PATH = Path(os.path.expanduser("~/.usage/agy_quota_cache.json"))
+AUTH_EXPIRED_PATH = CACHE_PATH.parent / "agy_auth_expired"
+_CLI_LOG_PATH = CACHE_PATH.parent / "agy_usage_cli.log"
+
+
+def auth_expired() -> bool:
+    return AUTH_EXPIRED_PATH.exists()
+
+
+def _mark_auth_expired() -> None:
+    with suppress(OSError):
+        AUTH_EXPIRED_PATH.parent.mkdir(parents=True, exist_ok=True)
+        AUTH_EXPIRED_PATH.touch()
+
+
 # Legacy OAuth token written by older Antigravity CLI versions. Read-only: we
 # never write back here (that is the CLI's home and could corrupt its login).
 _TOKEN_PATH = Path(os.path.expanduser("~/.gemini/antigravity-cli/antigravity-oauth-token"))
@@ -46,7 +61,8 @@ _KEYRING_BASE64_PREFIX = "go-keyring-base64:"
 
 _TOKEN_URL = "https://oauth2.googleapis.com/token"
 _QUOTA_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
-# Both endpoints return small JSON objects; cap the read so a broken endpoint
+_MODELS_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
+# All endpoints return small JSON objects; cap the read so a broken endpoint
 # cannot make us buffer an unbounded response.
 _MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 # Antigravity's installed-app public client constants (same values quotio ships).
@@ -63,6 +79,9 @@ _CLIENT_SECRET = "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"
 _DEFAULT_RETRY_AFTER_SECONDS = 60.0
 _MAX_RETRY_AFTER_SECONDS = 3600.0
 _rate_limit_until_monotonic = 0.0
+# When each group last appeared in a real API response; in memory only, reset on restart.
+_group_seen_at: dict[str, datetime] = {}
+_MISSING_GROUP_GRACE_MINUTES = 30
 
 
 def _user_agent() -> str:
@@ -92,8 +111,8 @@ class AgyQuotaGroup:
 
     name: str
     models: list[str]
-    weekly: AgyQuotaWindow
-    five_hour: AgyQuotaWindow
+    weekly: AgyQuotaWindow | None
+    five_hour: AgyQuotaWindow | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,9 +124,14 @@ class AgyQuotaResult:
 
 
 def probe_quota(timeout_seconds: float = 15) -> AgyQuotaResult | None:
-    """Fetch the quota summary via the Cloud Code API, returning no result on failure."""
+    """Fetch the quota from the Antigravity CLI, else the Cloud Code API; None on failure."""
     if timeout_seconds <= 0:
         return None
+    result = _probe_via_cli(timeout_seconds)
+    if result is not None:
+        with suppress(OSError):
+            AUTH_EXPIRED_PATH.unlink(missing_ok=True)
+        return result
     access_token = _resolve_access_token(timeout_seconds)
     if access_token is None:
         return None
@@ -115,6 +139,49 @@ def probe_quota(timeout_seconds: float = 15) -> AgyQuotaResult | None:
     if raw is None:
         return None
     groups_raw = _extract_groups(raw)
+    if not groups_raw:
+        return None
+    models_raw = None
+    if not any(_group_id(group) == "gemini" for group in groups_raw):
+        models_raw = _post_json(_MODELS_URL, access_token, {}, timeout_seconds)
+    result = _build_result(groups_raw, models_raw)
+    if result is not None:
+        with suppress(OSError):
+            AUTH_EXPIRED_PATH.unlink(missing_ok=True)
+    return result
+
+
+def _probe_via_cli(timeout: float) -> AgyQuotaResult | None:
+    """Read ``agy -p /usage`` JSON, the only source that reports the Gemini weekly window.
+
+    The slash command makes no model call. ``--log-file`` reuses one file instead of
+    leaving a new log in the CLI's log directory on every probe.
+    """
+    agy = find_agy()
+    if agy is None:
+        return None
+    command = [agy, "-p", "/usage", "--output-format", "json", "--log-file", str(_CLI_LOG_PATH)]
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+            **hidden_console_kwargs(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    try:
+        payload = json.loads(completed.stdout)
+    except ValueError:
+        return None
+    command_info = payload.get("command") if isinstance(payload, dict) else None
+    groups_raw = _extract_groups(
+        command_info.get("data") if isinstance(command_info, dict) else None
+    )
     if not groups_raw:
         return None
     return _build_result(groups_raw)
@@ -143,8 +210,54 @@ def load_quota(max_age_minutes: float = 5) -> AgyQuotaResult | None:
     probed = probe_quota()
     if probed is None:
         return cached
+    probed = _carry_missing_groups(probed, cached)
     _write_cache(probed)
     return probed
+
+
+def _carry_missing_groups(probed: AgyQuotaResult, cached: AgyQuotaResult | None) -> AgyQuotaResult:
+    """Keep a group the API skipped this once, so the group toggle has something to show.
+
+    A group is carried only while the API last returned it within the grace window, so a
+    group Google really removes drops out instead of living on in the cache forever.
+    """
+    now = datetime.now(UTC)
+    for group in probed.groups:
+        _group_seen_at[group.name] = now
+    if cached is None:
+        return probed
+    names = {group.name for group in probed.groups}
+    grace = timedelta(minutes=_MISSING_GROUP_GRACE_MINUTES)
+    missing = [
+        group
+        for group in cached.groups
+        if group.name not in names
+        and group.name in _group_seen_at
+        and now - _group_seen_at[group.name] <= grace
+    ]
+    if not missing:
+        return probed
+    cached_at = _parse_timestamp(cached.fetched_at)
+    probed_at = _parse_timestamp(probed.fetched_at)
+    elapsed = (
+        max(0, int((probed_at - cached_at).total_seconds() // 60))
+        if cached_at is not None and probed_at is not None
+        else 0
+    )
+
+    def age_window(window: AgyQuotaWindow | None) -> AgyQuotaWindow | None:
+        if window is None or window.resets_in_minutes is None or elapsed == 0:
+            return window
+        minutes = max(0, window.resets_in_minutes - elapsed)
+        return replace(window, resets_in_minutes=minutes, resets_in=_format_resets_in(minutes))
+
+    missing = [
+        replace(group, weekly=age_window(group.weekly), five_hour=age_window(group.five_hour))
+        for group in missing
+    ]
+    order = {group.name: index for index, group in enumerate(cached.groups)}
+    groups = sorted([*probed.groups, *missing], key=lambda group: order.get(group.name, 0))
+    return AgyQuotaResult(groups=groups, fetched_at=probed.fetched_at)
 
 
 def _resolve_access_token(timeout: float) -> str | None:
@@ -353,6 +466,20 @@ def _refresh_token(refresh_token: str, timeout: float) -> tuple[str, int] | None
         payload = json.loads(raw)
     except HTTPError as exc:
         _handle_http_error(exc)
+        if exc.code == 401:
+            _mark_auth_expired()
+        elif exc.code == 400:
+            try:
+                raw_error = exc.read(_MAX_RESPONSE_BYTES + 1)
+                if len(raw_error) <= _MAX_RESPONSE_BYTES:
+                    error_payload = json.loads(raw_error)
+                    if (
+                        isinstance(error_payload, dict)
+                        and error_payload.get("error") == "invalid_grant"
+                    ):
+                        _mark_auth_expired()
+            except (OSError, ValueError):
+                pass
         return None
     except (URLError, OSError, ValueError):
         return None
@@ -387,6 +514,8 @@ def _post_json(url: str, access_token: str, body: dict[str, object], timeout: fl
         return json.loads(raw)
     except HTTPError as exc:
         _handle_http_error(exc)
+        if exc.code == 401:
+            _mark_auth_expired()
         return None
     except (URLError, OSError, ValueError):
         return None
@@ -441,7 +570,9 @@ def _extract_groups(raw: object) -> list[dict[str, object]] | None:
     return None
 
 
-def _build_result(groups_raw: list[dict[str, object]]) -> AgyQuotaResult | None:
+def _build_result(
+    groups_raw: list[dict[str, object]], models_raw: object = None
+) -> AgyQuotaResult | None:
     """Classify buckets into the Gemini / Claude-GPT groups UI expects."""
     windows: dict[str, dict[str, AgyQuotaWindow]] = {}
     for group in groups_raw:
@@ -463,19 +594,56 @@ def _build_result(groups_raw: list[dict[str, object]]) -> AgyQuotaResult | None:
                 continue
             slot[period] = window
     result_groups = _assemble_groups(windows)
+    if not any(_group_id(group) == "gemini" for group in groups_raw):
+        gemini = _gemini_group_from_models(models_raw)
+        if gemini is not None:
+            result_groups.insert(0, gemini)
     if not result_groups:
         return None
     return AgyQuotaResult(groups=result_groups, fetched_at=datetime.now(UTC).isoformat())
 
 
+def _gemini_group_from_models(raw: object) -> AgyQuotaGroup | None:
+    """Use the lowest reported Gemini fraction and classify its reset window."""
+    models = raw.get("models") if isinstance(raw, dict) else None
+    if not isinstance(models, dict):
+        return None
+    candidates: list[tuple[float, dict[str, object]]] = []
+    for model_id, model in models.items():
+        if not isinstance(model_id, str) or not model_id.startswith("gemini-"):
+            continue
+        info = model.get("quotaInfo") if isinstance(model, dict) else None
+        if not isinstance(info, dict):
+            continue
+        fraction = _coerce_float(info.get("remainingFraction"))
+        reset = _bucket_reset_time(info)
+        if fraction is not None and reset is not None and _parse_timestamp(reset) is not None:
+            candidates.append((fraction, info))
+    if not candidates:
+        return None
+    _, bucket = min(candidates, key=lambda candidate: candidate[0])
+    window = _bucket_to_window(bucket)
+    reset = _bucket_reset_time(bucket)
+    assert reset is not None
+    session = _seconds_until(reset) <= 5 * 3600 + 5 * 60
+    template = _assemble_groups({"gemini": {}})[0]
+    return AgyQuotaGroup(
+        name=template.name,
+        models=template.models,
+        weekly=None if session else window,
+        five_hour=window if session else None,
+    )
+
+
 def _assemble_groups(
     windows: dict[str, dict[str, AgyQuotaWindow]],
 ) -> list[AgyQuotaGroup]:
-    """Lay out the two UI groups in fixed order, filling missing windows as full."""
+    """Lay out UI groups in fixed order; Argon has no five-hour window."""
     full = AgyQuotaWindow(100.0, None, None)
     layout = (
         ("gemini", "GEMINI MODELS", ["Gemini Flash", "Gemini Pro"]),
         ("claude-gpt", "CLAUDE AND GPT MODELS", ["Claude Opus", "Claude Sonnet", "GPT-OSS"]),
+        ("argon", "GEMINI 4 ARGON", ["Gemini 4 Argon"]),
     )
     groups: list[AgyQuotaGroup] = []
     for group_id, name, models in layout:
@@ -487,7 +655,7 @@ def _assemble_groups(
                 name=name,
                 models=list(models),
                 weekly=slot.get("weekly", full),
-                five_hour=slot.get("session", full),
+                five_hour=None if group_id == "argon" else slot.get("session", full),
             )
         )
     return groups
@@ -498,6 +666,8 @@ def _group_id(group: dict[str, object]) -> str | None:
     if name is None:
         return None
     lower = name.lower()
+    if "argon" in lower:
+        return "argon"
     if "gemini" in lower:
         return "gemini"
     if "claude" in lower or "gpt" in lower:
@@ -680,7 +850,11 @@ def _result_to_payload(result: AgyQuotaResult) -> dict[str, object]:
     }
 
 
-def _window_to_payload(window: AgyQuotaWindow) -> dict[str, float | int | str | None]:
+def _window_to_payload(
+    window: AgyQuotaWindow | None,
+) -> dict[str, float | int | str | None] | None:
+    if window is None:
+        return None
     return {
         "remaining_percent": window.remaining_percent,
         "resets_in": window.resets_in,
@@ -718,8 +892,10 @@ def _group_from_payload(payload: object) -> AgyQuotaGroup | None:
         or not name
         or not isinstance(models, list)
         or not all(isinstance(model, str) and model for model in models)
-        or weekly is None
-        or five_hour is None
+        or "weekly" not in payload
+        or "five_hour" not in payload
+        or (payload["weekly"] is not None and weekly is None)
+        or (payload["five_hour"] is not None and five_hour is None)
     ):
         return None
     return AgyQuotaGroup(name=name, models=models, weekly=weekly, five_hour=five_hour)

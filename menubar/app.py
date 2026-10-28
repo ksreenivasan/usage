@@ -14,11 +14,8 @@ import logging
 import os
 import threading
 import time
-import tomllib
 import webbrowser
 from collections.abc import Callable, Mapping
-from importlib import metadata
-from pathlib import Path
 from typing import Any, cast
 
 import objc
@@ -35,8 +32,6 @@ from AppKit import (
 from Foundation import NSObject, NSRunLoop, NSRunLoopCommonModes, NSTimer
 
 import panels
-from fsevents_watch import FileEventChanges, cleanup_fsevents, setup_fsevents
-from i18n import _t, packaged_resource_path
 from installer import login_item
 from installer.statusline_settings import (
     _claude_settings_path as _claude_settings_path,
@@ -63,6 +58,7 @@ from installer.statusline_settings import (
     _toggle_statusline_settings as _toggle_statusline_settings,
 )
 from loaders import agy_loader, codex_loader
+from loaders.claude_usage import ClaudeUsageClient, PollOutcome
 from loaders.history_loader import (
     UsageEntry,
 )
@@ -70,6 +66,7 @@ from loaders.history_loader import (
     flush_caches_on_terminate as flush_history_cache,
 )
 from menubar import actions as menubar_actions
+from menubar import manual_refresh, whats_new
 from menubar import menu as menubar_menu
 from menubar import notify as menubar_notify
 from menubar import refresh as menubar_refresh
@@ -82,13 +79,17 @@ from menubar.actions import (
 from menubar.chrome import (
     _make_alert,
 )
+from menubar.fsevents_watch import FileEventChanges, cleanup_fsevents, setup_fsevents
 from menubar.popover import PopoverViewController, _popover_size
+from menubar.popover import (
+    _invalidate_restored_content_height as _invalidate_restored_content_height,
+)
 from menubar.prefs import (
-    _auto_update_check_enabled,
     _hide_agy_enabled,
     _hide_claude_enabled,
     _hide_codex_enabled,
     _hide_grok_enabled,
+    _hide_muse_enabled,
     _quota_card_order,
     _quota_notification_thresholds,
     _quota_notifications_enabled,
@@ -137,10 +138,7 @@ from menubar.state import (
     _group_name as _group_name,
 )
 from menubar.state import (
-    _statusline_payload as _statusline_payload,
-)
-from menubar.state import (
-    _today_title as _today_title,
+    _today_total as _today_total,
 )
 from menubar.state import (
     format_human_time as format_human_time,
@@ -153,16 +151,16 @@ from panels.base import (
 from panels.dynamic_height import clamp_content_height
 from panels.panel_window import PanelWindow
 from panels.panel_window_state import save_panel_window_top_left
-from prefs import _load_preferences, _save_preferences
-from pricing import warm_up_pricing
 from quota.burn_rate import BurnRateTracker
+from quota.notifications import NotificationEvent, QuotaNotifier
 from quota.usage_rate import UsageRateTracker
 from updates import checker as update_checker
 from updates import gate as update_gate
-from updates.release_notes import format_release_notes
-from usage_client import ClaudeUsageClient, PollOutcome
+from usage_common.app_version import current_version as _current_version
+from usage_common.i18n import _t
+from usage_common.prefs import _load_preferences, _save_preferences
+from usage_common.pricing import warm_up_pricing
 from usage_common.usage_lang import detect_lang
-from usage_notifications import NotificationEvent, QuotaNotifier
 
 __all__ = [
     "CLAUDE_COLOR",
@@ -180,7 +178,6 @@ __all__ = [
     "_missing_row",
     "_quota_row",
     "format_human_time",
-    "_auto_update_check_enabled",
     "_hide_agy_enabled",
     "_hide_claude_enabled",
     "_hide_codex_enabled",
@@ -218,34 +215,6 @@ def _terse_mode_enabled() -> bool:
         return session_hooks.is_terse_mode_enabled()
     except Exception:
         return False
-
-
-def _current_version() -> str:
-    try:
-        return metadata.version("usage-cli")
-    except metadata.PackageNotFoundError as exc:
-        pyproject = packaged_resource_path(
-            "pyproject.toml", Path(__file__).with_name("pyproject.toml")
-        )
-        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-        version = data.get("project", {}).get("version")
-        if isinstance(version, str):
-            return version
-        raise RuntimeError("project.version missing from pyproject.toml") from exc
-
-
-def _invalidate_restored_content_height(panel: Any, view: Any) -> None:
-    if not getattr(panel, "_content_height_reports_available", True):
-        return
-    if panel_window_state.load_panel_content_height(panel.id) is None:
-        return
-    if not hasattr(view, "evaluateJavaScript_completionHandler_"):
-        return
-    view.evaluateJavaScript_completionHandler_(
-        'typeof window.usageInvalidateContentHeight === "function" && '
-        "window.usageInvalidateContentHeight()",
-        None,
-    )
 
 
 _APP_DELEGATE: AppDelegate | None = None
@@ -305,6 +274,7 @@ class AppDelegate(NSObject):
             "agy_session": BurnRateTracker(),
             "agy_weekly": BurnRateTracker(),
         }
+        self._auto_check_schedule = update_gate.AutoCheckSchedule()
         self._quota_notifier = QuotaNotifier(_quota_notification_thresholds())
         self._refresh_in_flight = False
         self._refresh_queued = False
@@ -382,7 +352,7 @@ class AppDelegate(NSObject):
 
     def timerFired_(self, timer: Any) -> None:
         self._refresh()
-        self._clear_stale_update_cache()
+        menubar_update.on_poll_tick(self)
 
     def _reschedule_poll_timer(self, interval: float) -> None:
         if self.timer is not None and self.timer_interval == interval:
@@ -407,6 +377,7 @@ class AppDelegate(NSObject):
         self.refreshNow_(None)
 
     def _panel_window_did_hide(self) -> None:
+        self.popover_controller.evictInactivePanelViews()
         self._reschedule_poll_timer(max(self.interval, SLOW_POLL_INTERVAL_S))
 
     def windowDidMove_(self, notification: Any) -> None:
@@ -419,7 +390,7 @@ class AppDelegate(NSObject):
             self._panel_window_did_hide()
 
     def refreshNow_(self, sender: Any) -> None:
-        self._refresh(queue_if_busy=True)
+        manual_refresh.start_mac(self)
 
     def installHook_(self, sender: Any) -> None:
         thread = threading.Thread(target=self._install_hook_in_background, daemon=True)
@@ -534,6 +505,9 @@ class AppDelegate(NSObject):
     def toggleHideGrok_(self, sender: Any) -> None:
         self._toggle_hide_section(sender, "hide_grok_section", "hide_grok", _hide_grok_enabled)
 
+    def toggleHideMuse_(self, sender: Any) -> None:
+        self._toggle_hide_section(sender, "hide_muse_section", "hide_muse", _hide_muse_enabled)
+
     def toggleQuotaNotifications_(self, sender: Any) -> None:
         self._mark_switch_menu_action()
         prefs = _load_preferences()
@@ -579,6 +553,12 @@ class AppDelegate(NSObject):
         alert.runModal()
         self._refresh()
 
+    def toggleClaudePane_(self, sender: Any) -> None:
+        menubar_actions.toggle_claude_pane(self)
+
+    def _finishClaudePane_(self, result: dict[str, Any]) -> None:
+        menubar_actions.finish_claude_pane(self, result)
+
     def toggleTerseMode_(self, sender: Any) -> None:
         self._mark_switch_menu_action()
         thread = threading.Thread(target=self._toggle_terse_mode_in_background, daemon=True)
@@ -604,48 +584,11 @@ class AppDelegate(NSObject):
     def _maybe_check_update_in_background(self) -> None:
         menubar_update.maybe_check_update_in_background(self)
 
-    def _check_update_in_background(
-        self,
-        *,
-        manual: bool,
-        ignore_cooldown: bool,
-        ignore_skipped: bool,
-    ) -> None:
-        menubar_update.check_update_in_background(
-            self,
-            manual=manual,
-            ignore_cooldown=ignore_cooldown,
-            ignore_skipped=ignore_skipped,
-        )
+    def _check_update_in_background(self) -> bool:
+        return menubar_update.check_update_in_background(self)
 
     def _showUpdateAlert_(self, release: update_checker.ReleaseInfo) -> None:
-        alert = _make_alert()
-        alert.setMessageText_(_t(self.language, "update_alert_title", version=release.version))
-        alert.setInformativeText_(format_release_notes(release.body, UPDATE_ALERT_BODY_LIMIT))
-        alert.addButtonWithTitle_(_t(self.language, "update_btn_download"))
-        alert.addButtonWithTitle_(_t(self.language, "update_btn_later"))
-        alert.addButtonWithTitle_(_t(self.language, "update_btn_skip"))
-        result = int(alert.runModal())
-        action, pref_updates = update_gate.resolve_alert_choice(result, release.version)
-        if action == "open":
-            webbrowser.open(release.html_url)
-            return
-
-        prefs = _load_preferences()
-        prefs.update(pref_updates)
-        if action == "dismiss":
-            prefs["update_dismissed_at"] = time.time()
-        _save_preferences(prefs)
-
-    def _showNoUpdateAvailable_(self, result: Any) -> None:
-        alert = _make_alert()
-        alert.setMessageText_(_t(self.language, "update_no_new_version"))
-        alert.runModal()
-
-    def _showUpdateCheckFailed_(self, result: Any) -> None:
-        alert = _make_alert()
-        alert.setMessageText_(_t(self.language, "update_check_failed"))
-        alert.runModal()
+        menubar_update.show_update_alert(self, release, _make_alert())
 
     def _set_active_panel_id(self, panel_id: str) -> None:
         panel = panels.get_panel(panel_id)
@@ -816,7 +759,7 @@ class AppDelegate(NSObject):
             codex_model = result.get("codex_model", "unknown")
             self.codex_5h_pct = codex_5h_pct
             self.codex_model = codex_model
-            self.latest_state = state
+            self.latest_state = manual_refresh.finish_mac(self, state)
             self._process_quota_notifications(state)
             if self._panel_window_is_visible():
                 self.popover_controller.setState_(self.latest_state)
@@ -825,8 +768,7 @@ class AppDelegate(NSObject):
             menubar_title._set_button_title(self, state)
         finally:
             should_refresh_again = bool(self._refresh_queued)
-            self._refresh_queued = False
-            self._refresh_in_flight = False
+            self._refresh_queued = self._refresh_in_flight = False
         if should_refresh_again:
             self._refresh()
         if started_at:
@@ -836,7 +778,7 @@ class AppDelegate(NSObject):
             )
 
     def _clearRefreshInFlight_(self, _sender: Any) -> None:
-        self._refresh_in_flight = False
+        manual_refresh.fail_mac(self)
 
     def _load_codex_refresh_result(self) -> dict[str, Any]:
         history_scan = None if self.mock else self._history_source_scan()
@@ -899,38 +841,11 @@ class AppDelegate(NSObject):
     def _request_notification_authorization(self) -> None:
         if self.mock or not _quota_notifications_enabled():
             return
-        try:
-            center, constants = menubar_notify.user_notification_center()
-            options = constants["badge"] | constants["sound"] | constants["alert"]
-            center.requestAuthorizationWithOptions_completionHandler_(
-                options,
-                lambda granted, error: None,
-            )
-        except Exception:
-            if os.environ.get("USAGE_DEBUG") == "1":
-                logger.warning("notification authorization failed", exc_info=True)
+        menubar_notify.request_notification_authorization()
 
     def _process_quota_notifications(self, state: PopoverState) -> None:
         try:
-            events = self._quota_notifier.update(
-                {
-                    "claude_session": (
-                        state.claude_session.percent,
-                        state.claude_session.available,
-                    ),
-                    "claude_weekly": (state.claude_weekly.percent, state.claude_weekly.available),
-                    "codex_session": (state.codex_session.percent, state.codex_session.available),
-                    "codex_weekly": (state.codex_weekly.percent, state.codex_weekly.available),
-                    "agy_session": (
-                        state.agy_session.percent,
-                        state.agy_session.available and state.agy_stale is None,
-                    ),
-                    "agy_weekly": (
-                        state.agy_weekly.percent,
-                        state.agy_weekly.available and state.agy_stale is None,
-                    ),
-                }
-            )
+            events = self._quota_notifier.update(menubar_notify.notification_channels(state))
             for event in events:
                 if _quota_notifications_enabled() and not self.mock:
                     self._send_quota_notification(event, state)
@@ -1006,17 +921,12 @@ class AppDelegate(NSObject):
 
     def _finishStatuslineAction_(self, result: dict[str, Any]) -> None:
         self._refresh()
-        self._refresh_statusline_state()
         if result.get("ok", True):
             return
         alert = _make_alert()
         alert.setMessageText_(_t(self.language, "statusline_action_failed"))
         alert.setInformativeText_(str(result.get("output") or result.get("action") or ""))
         alert.runModal()
-
-    def _refresh_statusline_state(self) -> None:
-        self.latest_state.statusline = _statusline_payload(self.language)
-        self.popover_controller.setState_(self.latest_state)
 
     def _analyze_usage_in_background(self, period: str) -> None:
         menubar_actions.analyze_usage_in_background(self, period)
@@ -1061,11 +971,17 @@ class AppDelegate(NSObject):
         return menubar_state.app_project_rows(self, hours_back=hours_back, entries=entries)
 
 
-def run_app(mock: bool = False, interval: int = 60) -> None:
+def run_app(
+    mock: bool = False,
+    interval: int = 60,
+    preferences_snapshot: Mapping[str, Any] | None = None,
+) -> None:
     global _APP_DELEGATE
+    snapshot = _load_preferences() if preferences_snapshot is None else preferences_snapshot
     app = NSApplication.sharedApplication()
     _APP_DELEGATE = AppDelegate.alloc().initWithMock_interval_(mock, interval)
     app.setDelegate_(_APP_DELEGATE)
+    whats_new.start(_current_version(), snapshot, _APP_DELEGATE.language)
     app.run()
 
 

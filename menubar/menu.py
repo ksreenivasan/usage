@@ -10,22 +10,27 @@ from typing import Any, Protocol
 
 from AppKit import NSMakePoint, NSMenu, NSMenuItem
 
-from i18n import _t
-from installer import login_item
+from installer import claude_pane, login_item, session_hooks
+from installer.statusline_settings import _statusline_enabled
+from menubar.new_badge import apply_badge
 from menubar.prefs import (
     _hide_agy_enabled,
     _hide_claude_enabled,
     _hide_codex_enabled,
     _hide_grok_enabled,
+    _hide_muse_enabled,
     _quota_notifications_enabled,
     _window_keeper_enabled,
 )
+from usage_common.i18n import _t
 
 
 class _SwitchMenuApp(Protocol):
     language: str
     active_panel: Any
     _switch_menu_action_taken: bool
+    _beginner_menu_target: Any
+    _quota_aware_menu_target: Any
 
     def _resync_popover_after_menu(self) -> None: ...
 
@@ -50,6 +55,20 @@ def build_menu_item(
         item.setState_(1 if state else 0)
     if tooltip_key is not None:
         item.setToolTip_(_t(language, tooltip_key))
+    if title_key == "window_keeper_menu" and state:
+        from quota.keeper_outcome import failure_tooltip
+
+        failures = failure_tooltip(language)
+        if failures:
+            item.setTitle_(_t(language, title_key) + " ⚠")
+            item.setToolTip_(failures + "\n" + _t(language, "window_keeper_tooltip"))
+    if title_key == "terse_mode_menu" and state:
+        from installer.codex_hook_trust import codex_terse_hook_trust
+
+        trust = codex_terse_hook_trust()
+        if trust in ("untrusted", "disabled"):
+            item.setTitle_(_t(language, title_key) + " ⚠")
+            item.setToolTip_(_t(language, f"terse_codex_hook_{trust}"))
     return item
 
 
@@ -119,12 +138,21 @@ def build_switch_menu(app: _SwitchMenuApp, sender: Any) -> None:
             state=_hide_grok_enabled(),
         )
     )
+    hide_submenu.addItem_(
+        build_menu_item(
+            app.language,
+            "muse_name",
+            "toggleHideMuse:",
+            target=app,
+            state=_hide_muse_enabled(),
+        )
+    )
     hide_parent = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
         _t(app.language, "hide_sections_menu"), "", ""
     )
     hide_parent.setSubmenu_(hide_submenu)
     menu.addItem_(hide_parent)
-    # Plain on/off switches sit together in the second group.
+    # General app settings.
     menu.addItem_(NSMenuItem.separatorItem())
     menu.addItem_(
         build_menu_item(
@@ -154,10 +182,7 @@ def build_switch_menu(app: _SwitchMenuApp, sender: Any) -> None:
             tooltip_key="window_keeper_tooltip",
         )
     )
-    # Project Butler: one toggle that hands last session's progress to the next
-    # one. Tooltip carries the full explanation so the menu line stays short.
-    # Grouped with the plain switches above it — a separate section here just
-    # added a divider with no real category difference.
+    menu.addItem_(NSMenuItem.separatorItem())
     menu.addItem_(
         build_menu_item(
             app.language,
@@ -178,6 +203,63 @@ def build_switch_menu(app: _SwitchMenuApp, sender: Any) -> None:
             tooltip_key="terse_mode_tooltip",
         )
     )
+    menu.addItem_(NSMenuItem.separatorItem())
+    # Claude Code-only switches stay collapsed in a submenu, like the panel themes.
+    claude_submenu = NSMenu.alloc().initWithTitle_(_t(app.language, "claude_code_section"))
+    claude_submenu.addItem_(
+        build_menu_item(
+            app.language,
+            "statusline_sync_menu",
+            "toggleStatusline:",
+            target=app,
+            state=_statusline_enabled(),
+            tooltip_key="statusline_sync_tooltip",
+        )
+    )
+    claude_pane_item = build_menu_item(
+        app.language,
+        "claude_pane_section_menu",
+        "toggleClaudePane:",
+        target=app,
+        state=claude_pane.is_claude_pane_enabled(),
+        tooltip_key="claude_pane_tooltip",
+    )
+    apply_badge(claude_pane_item, app.language, "claude_pane")
+    claude_submenu.addItem_(claude_pane_item)
+    from menubar.actions import BeginnerMenuTarget
+
+    beginner_target = BeginnerMenuTarget.alloc().init()
+    beginner_target.app = app
+    # NSMenuItem does not retain its target; hold it through background completion.
+    app._beginner_menu_target = beginner_target
+    beginner_item = build_menu_item(
+        app.language,
+        "claude_beginner_menu",
+        "toggleClaudeBeginner:",
+        target=beginner_target,
+        state=claude_pane.is_claude_beginner_enabled(),
+        tooltip_key="claude_beginner_tooltip",
+    )
+    claude_submenu.addItem_(beginner_item)
+    from menubar.actions import QuotaAwareMenuTarget
+
+    quota_target = QuotaAwareMenuTarget.alloc().init()
+    quota_target.app = app
+    app._quota_aware_menu_target = quota_target
+    quota_item = build_menu_item(
+        app.language,
+        "quota_aware_menu",
+        "toggleQuotaAware:",
+        target=quota_target,
+        state=session_hooks.is_quota_aware_enabled(),
+        tooltip_key="quota_aware_tooltip",
+    )
+    claude_submenu.addItem_(quota_item)
+    claude_parent = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        _t(app.language, "claude_code_section"), "", ""
+    )
+    claude_parent.setSubmenu_(claude_submenu)
+    menu.addItem_(claude_parent)
     app._switch_menu_action_taken = False
     menu.popUpMenuPositioningItem_atLocation_inView_(None, NSMakePoint(0, 0), sender)
     # Dismissing the menu without picking anything used to close the panel:

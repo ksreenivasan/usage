@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Any
 
 import main
+from loaders.claude_usage import PollOutcome, PollState, UsageSnapshot
 from tui.app import AppViewState
-from usage_client import PollOutcome, PollState, UsageSnapshot
 
 
 def _parse_args(monkeypatch: Any, *args: str) -> Any:
@@ -68,6 +68,19 @@ def test_parse_args_setup(monkeypatch: Any) -> None:
     args = _parse_args(monkeypatch, "--setup")
 
     assert args.setup is True
+
+
+def test_main_delegates_status_before_logging(monkeypatch: Any) -> None:
+    from usage_app import cli as usage_cli
+
+    calls: list[str] = []
+    monkeypatch.setattr(sys, "argv", ["usage", "status", "--json"])
+    monkeypatch.setattr(main, "_setup_logging", lambda: calls.append("logging"))
+    monkeypatch.setattr(usage_cli, "main", lambda: calls.append("status"))
+
+    main.main()
+
+    assert calls == ["status"]
 
 
 def test_apply_outcome_success_updates_snapshot_and_clears_fatal_message() -> None:
@@ -132,6 +145,7 @@ def _patch_main_for_win32(monkeypatch: Any, calls: list[dict[str, Any]]) -> None
             },
         )(),
     )
+    monkeypatch.setattr(main, "_load_preferences", lambda: {})
     monkeypatch.setattr(main, "_self_heal", lambda: None)
     monkeypatch.setattr(main, "run_tui", fake_run_tui)
     monkeypatch.setattr(main, "_t", lambda key: "fallback")

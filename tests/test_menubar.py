@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,14 +21,16 @@ import pytest
 import panels
 import quota.agy_window_keeper as agy_window_keeper
 import quota.window_keeper as window_keeper
-from installer import statusline_settings
+from installer import session_hooks, statusline_settings
 from loaders import codex_loader, grok_loader, history_loader
+from loaders.claude_usage import PollOutcome, PollState, UsageSnapshot
 from menubar import actions as menubar_actions
 from menubar import agy as menubar_agy
 from menubar import app as menubar
 from menubar import chrome as menubar_chrome
 from menubar import grok as menubar_grok
 from menubar import menu as menubar_menu
+from menubar import muse as menubar_muse
 from menubar import popover as menubar_popover
 from menubar import prefs as menubar_prefs
 from menubar import refresh as menubar_refresh
@@ -35,8 +39,9 @@ from menubar import title as menubar_title
 from menubar import update as menubar_update
 from panels import panel_window_state
 from quota.burn_rate import BurnRateTracker
-from service_status import ServiceStatus
-from usage_client import PollOutcome, PollState, UsageSnapshot
+from updates.gate import AutoCheckSchedule
+from usage_common.i18n import _t
+from usage_common.service_status import ServiceStatus
 
 
 @pytest.fixture(autouse=True)
@@ -175,9 +180,8 @@ def _build_popover_state(
         language=delegate.language,
         group=delegate.tracker.group(),
         burn_rate_trackers=delegate.burn_rate_trackers,
-        today_text=menubar._today_title(delegate.mock, delegate.language),
-        yesterday_text=menubar_state._yesterday_title(delegate.mock, delegate.language),
-        statusline=menubar._statusline_payload(delegate.language),
+        today_total=menubar._today_total(delegate.mock),
+        yesterday_total=menubar_state._yesterday_total(delegate.mock),
         show_install_button=(
             not hide_claude
             and outcome.state == PollState.TOKEN_ERROR
@@ -236,7 +240,8 @@ def test_format_human_time_minutes_hours_and_days() -> None:
 
 def test_format_percent() -> None:
     assert menubar._format_percent(50.0) == "50"
-    assert menubar._format_percent(50.5) == "50.5"
+    assert menubar._format_percent(50.5) == "50"
+    assert menubar._format_percent(99.7) == "99"
     assert menubar._format_percent(0.0) == "0"
 
 
@@ -305,7 +310,7 @@ def test_quota_row_formats_available_row() -> None:
 
     assert row.available is True
     assert row.percent == 50.5
-    assert row.percent_text == "50.5% 已用"
+    assert row.percent_text == "50% 已用"
     assert row.reset_text.startswith("重置 ")
     assert row.warning is False
     assert row.color == menubar.WARN_COLOR
@@ -334,19 +339,21 @@ def test_quota_row_shows_imminent_reset_with_30_seconds_remaining() -> None:
     assert row.warning is False
 
 
-def test_quota_row_shows_imminent_reset_at_zero_seconds() -> None:
+def test_quota_row_shows_done_reset_at_zero_seconds() -> None:
     row = menubar._quota_row(
         "Session", 50.0, 1_000.0, 1_000.0, menubar.CODEX_COLOR, language="zh-TW"
     )
 
-    assert row.reset_text == "即將重置"
+    assert row.reset_text == "已重置"
+    assert row.display_percent == 0.0
     assert row.warning is False
 
 
-def test_quota_row_shows_imminent_reset_after_reset_time() -> None:
+def test_quota_row_shows_done_reset_after_reset_time() -> None:
     row = menubar._quota_row("Session", 50.0, 970.0, 1_000.0, menubar.CODEX_COLOR, language="zh-TW")
 
-    assert row.reset_text == "即將重置"
+    assert row.reset_text == "已重置"
+    assert row.display_percent == 0.0
     assert row.warning is False
 
 
@@ -541,11 +548,13 @@ def test_quota_row_keeps_reset_text_when_percent_is_below_warning_floor() -> Non
     assert row.reset_text == "重置 51分鐘"
 
 
-def test_today_title_mock() -> None:
-    assert menubar._today_title(mock=True, language="zh-TW") == "今日：$45.20 (50,193,442 tokens)"
+def test_today_total_mock() -> None:
+    assert menubar._today_total(mock=True) == menubar_state.PeriodTotal(
+        tokens=50_193_442, cost=45.20
+    )
 
 
-def test_today_title_returns_zero_fallback_when_loaders_fail(
+def test_today_total_returns_zero_fallback_when_loaders_fail(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -554,10 +563,10 @@ def test_today_title_returns_zero_fallback_when_loaders_fail(
         lambda *, hours_back=24: (_ for _ in ()).throw(OSError),
     )
 
-    assert menubar._today_title(mock=False, language="zh-TW") == "今日：$0.00 (0 tokens)"
+    assert menubar._today_total(mock=False) == menubar_state.PeriodTotal()
 
 
-def test_today_title_does_not_reload_codex_when_entries_are_provided(
+def test_today_total_does_not_reload_codex_when_entries_are_provided(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     entry = history_loader.UsageEntry(
@@ -578,12 +587,12 @@ def test_today_title_does_not_reload_codex_when_entries_are_provided(
         lambda *, hours_back=24: pytest.fail("Codex should already be included"),
     )
 
-    assert menubar._today_title(mock=False, language="en", entries=[entry]) == (
-        "Today: $0.01 (150 tokens)"
+    assert menubar._today_total(mock=False, entries=[entry]) == menubar_state.PeriodTotal(
+        tokens=150, cost=0.01
     )
 
 
-def test_yesterday_title_uses_provided_entries() -> None:
+def test_yesterday_total_uses_provided_entries() -> None:
     entry = history_loader.UsageEntry(
         timestamp=datetime.now(tz=UTC) - timedelta(days=1),
         session_id="codex",
@@ -598,13 +607,13 @@ def test_yesterday_title_uses_provided_entries() -> None:
         project="usage",
     )
 
-    assert menubar_state._yesterday_title(False, "en", entries=[entry]) == (
-        "Yesterday: $0.01 (150 tokens)"
+    assert menubar_state._yesterday_total(False, entries=[entry]) == menubar_state.PeriodTotal(
+        tokens=150, cost=0.01
     )
 
 
 @pytest.mark.skipif(not hasattr(time, "tzset"), reason="requires POSIX timezone control")
-def test_yesterday_title_uses_dst_specific_day_boundaries(
+def test_yesterday_total_uses_dst_specific_day_boundaries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FixedDateTime(datetime):
@@ -640,8 +649,8 @@ def test_yesterday_title_uses_dst_specific_day_boundaries(
                 entry(datetime(2026, 3, 9, 4, 0, tzinfo=UTC)),
             ]
 
-            assert menubar_state._yesterday_title(False, "en", entries=entries) == (
-                "Yesterday: $0.01 (10 tokens)"
+            assert menubar_state._yesterday_total(False, entries=entries) == (
+                menubar_state.PeriodTotal(tokens=10, cost=0.01)
             )
     finally:
         if previous_tz is None:
@@ -666,12 +675,14 @@ def test_empty_state() -> None:
     assert state.projects_7d == []
     assert state.projects_30d == []
     assert state.projects_all == []
-    assert isinstance(state.statusline["enabled"], bool)
     assert state.show_install_button is False
-    assert state.yesterday_text == "Yesterday: $0.00 (0 tokens)"
+    assert state.yesterday_total == menubar_state.PeriodTotal()
 
 
-def test_switch_panel_menu_contains_update_items(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("quota_enabled", [True, False])
+def test_switch_panel_menu_contains_update_items(
+    monkeypatch: pytest.MonkeyPatch, quota_enabled: bool
+) -> None:
     delegate = menubar.AppDelegate.alloc().initWithMock_interval_(True, 60)
     delegate.language = "en"
     delegate.active_panel = SimpleNamespace(id="classic")
@@ -690,16 +701,13 @@ def test_switch_panel_menu_contains_update_items(monkeypatch: pytest.MonkeyPatch
         lambda: {"hide_codex_section": True},
     )
 
+    monkeypatch.setattr(session_hooks, "is_quota_aware_enabled", lambda: quota_enabled)
     _FakeMenu.instances = []
     menubar.AppDelegate.switchPanel_(delegate, object())
 
-    # Three menus are built: the main popup, the panel-themes submenu, and the
-    # provider-visibility submenu.
-    main_menu, panel_submenu, hide_submenu = (
-        _FakeMenu.instances[0],
-        _FakeMenu.instances[1],
-        _FakeMenu.instances[2],
-    )
+    # Four menus are built: the main popup, the panel-themes submenu, the
+    # provider-visibility submenu, and the Claude Code submenu.
+    main_menu, panel_submenu, hide_submenu, claude_submenu = _FakeMenu.instances
     main_titles = [item.title for item in main_menu.items]
 
     # The auto-update row is gone — update checks just stay on by default.
@@ -724,10 +732,11 @@ def test_switch_panel_menu_contains_update_items(monkeypatch: pytest.MonkeyPatch
         "Codex",
         "Antigravity",
         "Grok",
+        "Muse",
     ]
     hide_parent = next(item for item in main_menu.items if item.submenu is hide_submenu)
     assert hide_parent.title == "Hide Sections"
-    claude_item, codex_item, agy_item, grok_item = hide_submenu.items
+    claude_item, codex_item, agy_item, grok_item, muse_item = hide_submenu.items
     assert claude_item.action == "toggleHideClaude:"
     assert claude_item.state == 0
     assert codex_item.action == "toggleHideCodex:"
@@ -736,8 +745,35 @@ def test_switch_panel_menu_contains_update_items(monkeypatch: pytest.MonkeyPatch
     assert agy_item.state == 0
     assert grok_item.action == "toggleHideGrok:"
     assert grok_item.state == 0
+    assert muse_item.action == "toggleHideMuse:"
+    assert muse_item.state == 0
 
-    # Resume Last Session is a single tooltip-backed toggle (no group header, no indent).
+    settings = main_menu.items[main_titles.index(_t("en", "launch_at_login")) :]
+    assert [item.title for item in settings] == [
+        _t("en", "launch_at_login"),
+        _t("en", "quota_notifications_menu"),
+        _t("en", "window_keeper_menu"),
+        "---",
+        _t("en", "project_butler"),
+        _t("en", "terse_mode_menu"),
+        "---",
+        "Claude Code",
+    ]
+    assert settings[7].submenu is claude_submenu
+    assert [item.title for item in claude_submenu.items] == [
+        "Sync quota via status line",
+        "Side pane",
+        "Beginner Mode",
+        "Quota-Aware Mode",
+    ]
+    statusline, pane, beginner, quota = claude_submenu.items
+    assert statusline.action == "toggleStatusline:"
+    assert statusline.tooltip == _t("en", "statusline_sync_tooltip")
+    assert pane.title == _t("en", "claude_pane_section_menu")
+    assert pane.action == "toggleClaudePane:"
+    assert pane.tooltip == _t("en", "claude_pane_tooltip")
+
+    # Resume Last Session keeps its action and tooltip.
     butler = next(item for item in main_menu.items if item.action == "toggleSessionResume:")
     assert butler.title == "Resume Last Session"
     assert butler.indentation == 0
@@ -745,7 +781,35 @@ def test_switch_panel_menu_contains_update_items(monkeypatch: pytest.MonkeyPatch
     terse = next(item for item in main_menu.items if item.action == "toggleTerseMode:")
     assert terse.title == "Token Saver"
     assert terse.tooltip
+    assert beginner.action == "toggleClaudeBeginner:"
+    assert beginner.tooltip == _t("en", "claude_beginner_tooltip")
+    assert beginner.state == 0
+    assert beginner.target is delegate._beginner_menu_target
+    assert quota.action == "toggleQuotaAware:"
+    assert quota.state == int(quota_enabled)
+    assert quota.tooltip == _t("en", "quota_aware_tooltip")
+    assert quota.target is delegate._quota_aware_menu_target
+    assert pane.target is delegate
     assert "Show in report" not in main_titles
+
+
+@pytest.mark.parametrize(
+    ("language", "pane", "beginner", "original_pane"),
+    [
+        ("zh-TW", "側邊面板", "新手模式", "Claude Code 側邊面板"),
+        ("zh-CN", "侧边面板", "新手模式", "Claude Code 侧边面板"),
+        ("en", "Side pane", "Beginner Mode", "Claude Code side pane"),
+        ("ja", "サイドペイン", "初心者モード", "Claude Code サイドパネル"),
+        ("ko", "사이드 패널", "초보자 모드", "Claude Code 사이드 패널"),
+    ],
+)
+def test_claude_code_section_translations(
+    language: str, pane: str, beginner: str, original_pane: str
+) -> None:
+    assert _t(language, "claude_code_section") == "Claude Code"
+    assert _t(language, "claude_pane_section_menu") == pane
+    assert _t(language, "claude_beginner_menu") == beginner
+    assert _t(language, "claude_pane_menu") == original_pane
 
 
 def test_switch_panel_cancel_keeps_the_panel_open(
@@ -819,29 +883,6 @@ def test_switch_panel_cancel_keeps_the_panel_open(
     assert delegate.popover.shown == 0
 
 
-def test_auto_update_disabled_skips_background_check(monkeypatch: pytest.MonkeyPatch) -> None:
-    called = False
-
-    def fake_check_latest_release(current_version: str) -> object:
-        nonlocal called
-        called = True
-        return None
-
-    monkeypatch.setattr(menubar, "_load_preferences", lambda: {"auto_update_check": False})
-    monkeypatch.setattr(
-        "menubar.app.update_checker.check_latest_release", fake_check_latest_release
-    )
-
-    menubar.AppDelegate._check_update_in_background(
-        cast(Any, object()),
-        manual=False,
-        ignore_cooldown=False,
-        ignore_skipped=False,
-    )
-
-    assert called is False
-
-
 def test_update_check_keeps_preferences_saved_during_network_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -867,9 +908,6 @@ def test_update_check_keeps_preferences_saved_during_network_check(
 
     menubar.AppDelegate._check_update_in_background(
         cast(Any, object()),
-        manual=False,
-        ignore_cooldown=False,
-        ignore_skipped=False,
     )
 
     assert stored["hide_claude_section"] is True
@@ -886,9 +924,9 @@ def test_fresh_auto_update_check_skips_network_request(monkeypatch: pytest.Monke
         return SimpleNamespace(failed=False, release=None)
 
     monkeypatch.setattr(
-        menubar,
+        menubar_update,
         "_load_preferences",
-        lambda: {"auto_update_check": True, "last_update_check": {"checked_at": 1.0}},
+        lambda: {"last_update_check": {"checked_at": 1.0}},
     )
     monkeypatch.setattr("menubar.app.update_gate.auto_check_is_due", lambda prefs: False)
     monkeypatch.setattr(
@@ -898,43 +936,9 @@ def test_fresh_auto_update_check_skips_network_request(monkeypatch: pytest.Monke
 
     menubar.AppDelegate._check_update_in_background(
         cast(Any, object()),
-        manual=False,
-        ignore_cooldown=False,
-        ignore_skipped=False,
     )
 
     assert called is False
-
-
-def test_manual_update_check_ignores_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
-    called = False
-
-    def fake_check_latest_release_result(current_version: str) -> object:
-        nonlocal called
-        _ = current_version
-        called = True
-        return SimpleNamespace(failed=False, release=None)
-
-    monkeypatch.setattr(menubar_update, "_load_preferences", lambda: {"last_update_check": {}})
-    monkeypatch.setattr(menubar_update, "_save_preferences", lambda prefs: None)
-    monkeypatch.setattr(menubar, "_current_version", lambda: "0.11.3")
-    monkeypatch.setattr("menubar.app.update_gate.auto_check_is_due", lambda prefs: False)
-    monkeypatch.setattr(
-        "menubar.app.update_checker.check_latest_release_result",
-        fake_check_latest_release_result,
-    )
-    fake_self = SimpleNamespace(
-        performSelectorOnMainThread_withObject_waitUntilDone_=lambda *args: None,
-    )
-
-    menubar.AppDelegate._check_update_in_background(
-        cast(Any, fake_self),
-        manual=True,
-        ignore_cooldown=False,
-        ignore_skipped=False,
-    )
-
-    assert called is True
 
 
 def test_background_daily_maintenance_schedules_diagnosis_snapshot(
@@ -943,26 +947,32 @@ def test_background_daily_maintenance_schedules_diagnosis_snapshot(
     calls: list[object] = []
 
     monkeypatch.setattr(
-        "menubar.update.usage_diagnosis_snapshot.maybe_schedule_refresh",
+        "menubar.update.diagnosis_snapshot.maybe_schedule_refresh",
         lambda: calls.append("snapshot"),
+    )
+    monkeypatch.setattr(
+        "menubar.update.history_persist.maybe_schedule_refresh",
+        lambda: calls.append("history"),
     )
     fake_self = SimpleNamespace(
         _check_update_in_background=lambda **kwargs: calls.append(kwargs),
+        _auto_check_schedule=AutoCheckSchedule(),
     )
 
     menubar.AppDelegate._maybe_check_update_in_background(cast(Any, fake_self))
 
     assert calls == [
         "snapshot",
-        {"manual": False, "ignore_cooldown": False, "ignore_skipped": False},
+        "history",
+        {},
     ]
 
 
 def test_check_update_writes_cache_when_release_found(monkeypatch: pytest.MonkeyPatch) -> None:
     saved: list[dict[str, Any]] = []
-    monkeypatch.setattr(menubar_update, "_load_preferences", lambda: {"auto_update_check": True})
+    monkeypatch.setattr(menubar_update, "_load_preferences", lambda: {})
     monkeypatch.setattr(menubar_update, "_save_preferences", lambda d: saved.append(dict(d)))
-    monkeypatch.setattr(menubar, "_current_version", lambda: "0.11.3")
+    monkeypatch.setattr(menubar_update, "_current_version", lambda: "0.11.3")
     monkeypatch.setattr("updates.gate.time.time", lambda: 1700000000.0)
     fake_release = SimpleNamespace(version="0.12.0", html_url="https://x/v0.12.0", body="")
     monkeypatch.setattr(
@@ -975,9 +985,6 @@ def test_check_update_writes_cache_when_release_found(monkeypatch: pytest.Monkey
 
     menubar.AppDelegate._check_update_in_background(
         cast(Any, fake_self),
-        manual=False,
-        ignore_cooldown=False,
-        ignore_skipped=True,
     )
 
     assert saved
@@ -990,9 +997,9 @@ def test_check_update_writes_cache_when_release_found(monkeypatch: pytest.Monkey
 
 def test_check_update_writes_cache_when_no_release(monkeypatch: pytest.MonkeyPatch) -> None:
     saved: list[dict[str, Any]] = []
-    monkeypatch.setattr(menubar_update, "_load_preferences", lambda: {"auto_update_check": True})
+    monkeypatch.setattr(menubar_update, "_load_preferences", lambda: {})
     monkeypatch.setattr(menubar_update, "_save_preferences", lambda d: saved.append(dict(d)))
-    monkeypatch.setattr(menubar, "_current_version", lambda: "0.11.3")
+    monkeypatch.setattr(menubar_update, "_current_version", lambda: "0.11.3")
     monkeypatch.setattr("updates.gate.time.time", lambda: 1700000000.0)
     monkeypatch.setattr(
         "menubar.update.update_checker.check_latest_release_result",
@@ -1001,9 +1008,6 @@ def test_check_update_writes_cache_when_no_release(monkeypatch: pytest.MonkeyPat
 
     menubar.AppDelegate._check_update_in_background(
         cast(Any, object()),
-        manual=False,
-        ignore_cooldown=False,
-        ignore_skipped=False,
     )
 
     assert saved
@@ -1014,9 +1018,9 @@ def test_check_update_writes_cache_when_no_release(monkeypatch: pytest.MonkeyPat
 
 def test_check_update_skips_cache_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     saved: list[dict[str, Any]] = []
-    monkeypatch.setattr(menubar_update, "_load_preferences", lambda: {"auto_update_check": True})
+    monkeypatch.setattr(menubar_update, "_load_preferences", lambda: {})
     monkeypatch.setattr(menubar_update, "_save_preferences", lambda d: saved.append(dict(d)))
-    monkeypatch.setattr(menubar, "_current_version", lambda: "0.11.3")
+    monkeypatch.setattr(menubar_update, "_current_version", lambda: "0.11.3")
     monkeypatch.setattr(
         "menubar.app.update_checker.check_latest_release_result",
         lambda v: SimpleNamespace(failed=True, release=None),
@@ -1024,9 +1028,6 @@ def test_check_update_skips_cache_on_failure(monkeypatch: pytest.MonkeyPatch) ->
 
     menubar.AppDelegate._check_update_in_background(
         cast(Any, object()),
-        manual=False,
-        ignore_cooldown=False,
-        ignore_skipped=False,
     )
 
     assert saved == []
@@ -1046,7 +1047,7 @@ def test_clear_stale_update_cache_clears_after_upgrade(
     }
     monkeypatch.setattr(menubar_update, "_load_preferences", lambda: prefs)
     monkeypatch.setattr(menubar_update, "_save_preferences", lambda d: saved.append(dict(d)))
-    monkeypatch.setattr(menubar, "_current_version", lambda: "0.15.0")
+    monkeypatch.setattr(menubar_update, "_current_version", lambda: "0.15.0")
 
     menubar.AppDelegate._clear_stale_update_cache(cast(Any, object()))
 
@@ -1070,7 +1071,7 @@ def test_clear_stale_update_cache_keeps_pending_update(
     }
     monkeypatch.setattr(menubar, "_load_preferences", lambda: prefs)
     monkeypatch.setattr(menubar, "_save_preferences", lambda d: saved.append(dict(d)))
-    monkeypatch.setattr(menubar, "_current_version", lambda: "0.15.0")
+    monkeypatch.setattr(menubar_update, "_current_version", lambda: "0.15.0")
 
     menubar.AppDelegate._clear_stale_update_cache(cast(Any, object()))
 
@@ -1418,11 +1419,11 @@ def test_statusline_switch_survives_agy_failure(
     assert menubar._enable_statusline_settings() == 0
 
 
-def test_error_state_uses_message_and_mock_today_title() -> None:
+def test_error_state_uses_message_and_mock_today_total() -> None:
     state = menubar._error_state("boom", mock=True, language="zh-TW")
 
     assert "boom" in state.status_text
-    assert state.today_text == "今日：$45.20 (50,193,442 tokens)"
+    assert state.today_total == menubar_state.PeriodTotal(tokens=50_193_442, cost=45.20)
 
 
 def test_popover_size_has_positive_dimensions() -> None:
@@ -1582,8 +1583,10 @@ def test_hide_grok_enabled_reads_preferences(monkeypatch: pytest.MonkeyPatch) ->
     assert menubar._hide_grok_enabled({}) is False
 
 
+@pytest.mark.parametrize("provider", ["grok", "muse"])
 def test_toggle_hide_grok_persists_preference_and_updates_state(
     monkeypatch: pytest.MonkeyPatch,
+    provider: str,
 ) -> None:
     class FakeController:
         def __init__(self) -> None:
@@ -1602,12 +1605,12 @@ def test_toggle_hide_grok_persists_preference_and_updates_state(
     monkeypatch.setattr(menubar, "_save_preferences", lambda value: saved.append(dict(value)))
     monkeypatch.setattr(menubar_title, "_set_button_title", lambda _app, _state: None)
 
-    delegate.toggleHideGrok_(sender)
+    getattr(delegate, f"toggleHide{provider.title()}_")(sender)
 
-    assert preferences == {"hide_grok_section": True}
+    assert preferences == {f"hide_{provider}_section": True}
     assert saved == [preferences]
     assert sender.state == 1
-    assert delegate.latest_state.hide_grok is True
+    assert getattr(delegate.latest_state, f"hide_{provider}") is True
     assert delegate.popover_controller.states == [delegate.latest_state]
 
 
@@ -1619,6 +1622,7 @@ def test_popover_size_deducts_hidden_cards(monkeypatch: pytest.MonkeyPatch) -> N
         codex_card_height = 60.0
         agy_card_height = 40.0
         grok_card_height = 30.0
+        muse_card_height = 40.0
         service_alert_height = 0.0
 
         def build_view(self, delegate: Any) -> Any:
@@ -1628,7 +1632,7 @@ def test_popover_size_deducts_hidden_cards(monkeypatch: pytest.MonkeyPatch) -> N
             return None
 
         def preferred_size(self) -> tuple[float, float]:
-            return (300.0, 500.0)
+            return (300.0, 540.0)
 
     monkeypatch.setattr(menubar, "_load_preferences", lambda: {})
     state = menubar._empty_state()
@@ -1636,7 +1640,12 @@ def test_popover_size_deducts_hidden_cards(monkeypatch: pytest.MonkeyPatch) -> N
     state.hide_grok = False
     panel = FakePanel()
 
-    assert menubar_popover._popover_size(state, panel).height == 500.0
+    state.hide_muse = False
+    # Five visible cards replace the synthetic measured heights with 94px each.
+    assert menubar_popover._popover_size(state, panel).height == 740.0
+    state.hide_muse = True
+    # Four visible cards replace the synthetic measured heights with 94px each.
+    assert menubar_popover._popover_size(state, panel).height == 646.0
     state.hide_claude = True
     assert menubar_popover._popover_size(state, panel).height == 400.0
     state.hide_codex = True
@@ -1744,7 +1753,7 @@ def test_compose_title_hides_grok_when_enabled(monkeypatch: pytest.MonkeyPatch) 
 def test_compose_title_shows_grok_last(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(menubar, "_load_preferences", lambda: {})
     delegate = menubar.AppDelegate.alloc().initWithMock_interval_(True, 60)
-    delegate.codex_5h_pct = 12.0
+    delegate.codex_5h_pct = None
     state = menubar._empty_state()
     state.claude_session.percent = 50.0
     state.agy_session.percent = 25.0
@@ -1754,7 +1763,34 @@ def test_compose_title_shows_grok_last(monkeypatch: pytest.MonkeyPatch) -> None:
     state.hide_agy = False
     state.hide_grok = False
 
-    assert menubar_title._compose_title(delegate, state) == "50% · 12% · 25% · 47%"
+    assert menubar_title._compose_title(delegate, state) == "50% · 25% · 47%"
+
+
+def test_compose_title_keeps_three_highest_in_fixed_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(menubar, "_load_preferences", lambda: {})
+    delegate = menubar.AppDelegate.alloc().initWithMock_interval_(True, 60)
+    delegate.codex_5h_pct = 37.0
+    state = menubar._empty_state()
+    state.claude_session.percent = 2.0
+    state.agy_session.percent = 10.0
+    state.muse_session.percent = 12.0
+    state.hide_agy = False
+    state.hide_muse = False
+
+    assert menubar_title._compose_title(delegate, state) == "37% · 10% · 12%"
+
+    # A tie keeps the fixed order, so Claude wins over Antigravity.
+    state.claude_session.percent = 20.0
+    state.agy_session.percent = 20.0
+    state.muse_session.percent = 50.0
+    assert menubar_title._compose_title(delegate, state) == "20% · 37% · 50%"
+
+    # An unknown "--" ranks below even 0%.
+    state.claude_session.percent = None
+    state.agy_session.percent = 0.0
+    assert menubar_title._compose_title(delegate, state) == "37% · 0% · 50%"
 
 
 def test_compose_title_omits_grok_without_percent(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1829,7 +1865,7 @@ def test_load_history_entries_includes_codex_entries(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(
         menubar_state,
         "load_entries",
-        lambda *, hours_back, jsonl_paths=None: [claude_entry],
+        lambda *, hours_back, jsonl_paths=None, read_failures=None: [claude_entry],
     )
     monkeypatch.setattr(
         "menubar.state.codex_loader.load_entries",
@@ -1907,7 +1943,7 @@ def test_load_history_entries_includes_grok_entries(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(
         menubar_state,
         "load_entries",
-        lambda *, hours_back, jsonl_paths=None: [claude_entry],
+        lambda *, hours_back, jsonl_paths=None, read_failures=None: [claude_entry],
     )
     monkeypatch.setattr(
         "menubar.state.codex_loader.load_entries",
@@ -1967,6 +2003,7 @@ def test_load_history_entries_reuses_cache_when_sources_do_not_change(
         *,
         hours_back: int = 0,
         jsonl_paths: tuple[Path, ...] = (),
+        read_failures: list[Path] | None = None,
     ) -> list[history_loader.UsageEntry]:
         calls["claude"] += 1
         assert hours_back == 0
@@ -2070,7 +2107,10 @@ def test_load_history_entries_records_error_key_on_failure_and_clears_on_success
     monkeypatch.setattr(grok_loader, "load_entries", lambda hours_back=0: [])
 
     def failing_load_entries(
-        *, hours_back: int = 0, jsonl_paths: tuple[Path, ...] | None = None
+        *,
+        hours_back: int = 0,
+        jsonl_paths: tuple[Path, ...] | None = None,
+        read_failures: list[Path] | None = None,
     ) -> list[history_loader.UsageEntry]:
         raise OSError("cannot read jsonl")
 
@@ -2078,7 +2118,11 @@ def test_load_history_entries_records_error_key_on_failure_and_clears_on_success
     delegate._load_history_entries()
     assert delegate._history_load_error_key == "history_load_error_file"
 
-    monkeypatch.setattr(menubar_state, "load_entries", lambda *, hours_back=0, jsonl_paths=None: [])
+    monkeypatch.setattr(
+        menubar_state,
+        "load_entries",
+        lambda *, hours_back=0, jsonl_paths=None, read_failures=None: [],
+    )
     delegate._load_history_entries()
     assert delegate._history_load_error_key is None
 
@@ -2407,7 +2451,7 @@ def test_apply_codex_refresh_result_updates_quota_before_full_refresh(
     assert delegate.codex_5h_pct == 18.5
     assert delegate.codex_model == "gpt-test"
     assert controller.calls == [delegate.latest_state]
-    assert button.titles[-1].endswith("18.5%")
+    assert button.titles[-1].endswith("18%")
 
 
 def test_refresh_error_preserves_codex_quota(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2561,7 +2605,7 @@ def test_refresh_error_preserves_project_usage(monkeypatch: pytest.MonkeyPatch) 
     assert state.projects_7d == [("Eric-Tools", 165, 0.01)]
     assert state.projects_30d == [("Eric-Tools", 165, 0.01)]
     assert state.projects_all == [("Eric-Tools", 165, 0.01)]
-    assert "165 tokens" in state.today_text
+    assert state.today_total.tokens == 165
 
 
 def test_refresh_success_builds_popover_state_and_pings_window_keeper(
@@ -2613,11 +2657,6 @@ def test_refresh_success_builds_popover_state_and_pings_window_keeper(
         lambda reset_at, percent, source, mock: pings.append((reset_at, percent, source, mock)),
     )
     monkeypatch.setattr(agy_window_keeper, "maybe_ping", lambda *args: None)
-    monkeypatch.setattr(
-        menubar_state,
-        "_statusline_payload",
-        lambda language: {"enabled": False, "language": language},
-    )
 
     class Delegate:
         mock = False
@@ -2669,6 +2708,8 @@ def test_refresh_success_builds_popover_state_and_pings_window_keeper(
         agy_projection=menubar_agy.fallback_projection("en"),
         grok_result=grok_result,
         grok_projection=menubar_grok.fallback_projection("en"),
+        muse_result=menubar_muse.MuseRefreshResult(projection=None, hide_muse=True),
+        muse_projection=menubar_muse.fallback_projection("en"),
         debug_timing=False,
     )
 
@@ -2690,9 +2731,13 @@ def test_refresh_now_queues_when_refresh_is_busy() -> None:
     delegate._refresh_in_flight = True
     delegate._refresh_queued = False
 
+    delegate.popover = SimpleNamespace(isVisible=lambda: False)
     delegate.refreshNow_(None)
 
     assert delegate._refresh_queued is True
+    assert delegate.latest_state.status_text == _t(
+        delegate.language, "status_text", value=_t(delegate.language, "status_refreshing")
+    )
 
 
 def test_apply_refresh_result_clears_busy_flag_when_ui_update_fails() -> None:
@@ -3128,3 +3173,249 @@ def test_state_from_outcome_shows_setup_button_for_codex_only(
     )
 
     assert state.show_install_button is True
+
+
+def test_reset_title_keeps_notification_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    state = menubar._empty_state("en")
+    row = menubar._quota_row("Session", 100.0, 999.0, 1000.0, menubar.CLAUDE_COLOR)
+    state.claude_session = state.codex_session = state.agy_session = state.grok_weekly = row
+    state.hide_claude = state.hide_codex = state.hide_agy = state.hide_grok = False
+    app = SimpleNamespace(codex_5h_pct=100.0, _menubar_text_cache={})
+    assert menubar_title._compose_title(app, state) == "0% · 0% · 0%"
+    texts: list[str] = []
+    original_text_string = menubar_title._menubar_text_string
+
+    def record_text(app: Any, text: str) -> Any:
+        texts.append(text)
+        return original_text_string(app, text)
+
+    monkeypatch.setattr(menubar_title, "_menubar_text_string", record_text)
+    menubar_title._menubar_attributed_title(app, state)
+    assert texts.count(" 0%") == 3
+    state.claude_session = menubar._missing_row("Session", menubar.CLAUDE_COLOR)
+    state.codex_session = menubar._missing_row("", menubar.CODEX_COLOR)
+    state.codex_weekly = row
+    state.hide_claude = state.hide_agy = state.hide_grok = True
+    assert menubar_title._compose_title(app, state) == "0%"
+    assert row.percent == 100.0
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="update app requires AppKit")
+@pytest.mark.parametrize("outcome", [False, True, RuntimeError("failed")])
+def test_poll_tick_rechecks_without_startup_maintenance(
+    monkeypatch: pytest.MonkeyPatch, outcome: bool | Exception
+) -> None:
+    now = [100.0]
+    calls: list[dict[str, bool]] = []
+    cleared: list[bool] = []
+
+    def check(**kwargs: bool) -> bool:
+        calls.append(kwargs)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    def start(target: Any, args: tuple[Any, ...]) -> None:
+        with suppress(RuntimeError):
+            target(*args)
+
+    app = SimpleNamespace(
+        _auto_check_schedule=AutoCheckSchedule(), _check_update_in_background=check
+    )
+    monkeypatch.setattr("menubar.update.time.time", lambda: now[0])
+    monkeypatch.setattr(menubar_update, "clear_stale_update_cache", lambda: cleared.append(True))
+    monkeypatch.setattr(
+        menubar_update,
+        "maybe_check_update_in_background",
+        lambda *a: pytest.fail("poll must not run startup maintenance"),
+    )
+    monkeypatch.setattr(
+        "menubar.update.threading.Thread",
+        lambda *, target, args, daemon: SimpleNamespace(start=lambda: start(target, args)),
+    )
+    menubar_update.on_poll_tick(cast(Any, app))
+    now[0] += 3599
+    menubar_update.on_poll_tick(cast(Any, app))
+    assert len(calls) == 1
+    now[0] += 1
+    menubar_update.on_poll_tick(cast(Any, app))
+    assert calls == [{}] * 2
+    assert len(cleared) == 3
+    assert app._auto_check_schedule._failures == (0 if outcome is False else 2)
+
+
+@pytest.mark.parametrize(
+    ("ok", "enabled", "key"),
+    [
+        (True, True, "quota_aware_enabled_msg"),
+        (True, False, "quota_aware_disabled_msg"),
+        (False, False, "quota_aware_action_failed"),
+    ],
+)
+def test_quota_aware_completion_alert(
+    monkeypatch: pytest.MonkeyPatch, ok: bool, enabled: bool, key: str
+) -> None:
+    messages: list[str] = []
+    details: list[str] = []
+    completed: list[str] = []
+    alert = SimpleNamespace(
+        setMessageText_=messages.append,
+        setInformativeText_=details.append,
+        runModal=lambda: completed.append("alert"),
+    )
+    monkeypatch.setattr(menubar_actions, "_make_alert", lambda: alert)
+    target = menubar_actions.QuotaAwareMenuTarget.alloc().init()
+    target.app = cast(
+        Any, SimpleNamespace(language="en", _refresh=lambda: completed.append("refresh"))
+    )
+    target._finishQuotaAware_({"ok": ok, "enabled": enabled, "output": "failure details"})
+    assert messages == [_t("en", key)]
+    assert details == ([] if ok else ["failure details"])
+    assert completed == ["alert", "refresh"]
+
+
+def test_hiding_panel_evicts_inactive_views_via_existing_teardown() -> None:
+    from unittest.mock import Mock
+
+    controller = menubar_popover.PopoverViewController.alloc().init()
+    controller.panel = SimpleNamespace(id="current")
+    views = {name: Mock() for name in ("current", "old", "older")}
+    overlays = {name: Mock() for name in views}
+    controller.panel_views = dict(views)
+    controller.panel_lru = list(views)
+    controller.panel_scales = {name: (1.0, 100.0) for name in views}
+    controller.transition_overlays = dict(overlays)
+    controller.pending_panel_evictions = {"old"}
+    controller.evictInactivePanelViews()
+    assert controller.panel_views == {"current": views["current"]}
+    assert controller.panel_lru == ["current"]
+    assert controller.panel_scales == {"current": (1.0, 100.0)}
+    assert controller.transition_overlays == {"current": overlays["current"]}
+    assert controller.pending_panel_evictions == set()
+    for name in ("old", "older"):
+        views[name].teardown.assert_called_once_with()
+        views[name].removeFromSuperview.assert_called_once_with()
+        overlays[name].removeFromSuperview.assert_called_once_with()
+    views["current"].teardown.assert_not_called()
+    views["current"].removeFromSuperview.assert_not_called()
+    # An already scheduled eviction and a second close must be harmless.
+    controller.evictPanelViewForId_("old")
+    controller.evictInactivePanelViews()
+    views["old"].teardown.assert_called_once_with()
+
+
+def test_panel_window_hide_prunes_cache_and_keeps_slow_poll() -> None:
+    from unittest.mock import Mock
+
+    controller = SimpleNamespace(evictInactivePanelViews=Mock())
+    reschedule = Mock()
+    delegate = SimpleNamespace(
+        popover_controller=controller, interval=60, _reschedule_poll_timer=reschedule
+    )
+    menubar.AppDelegate._panel_window_did_hide(cast(Any, delegate))
+    controller.evictInactivePanelViews.assert_called_once_with()
+    reschedule.assert_called_once_with(300.0)
+
+
+@pytest.mark.parametrize(
+    "hidden,percent,reset,expected",
+    [
+        (False, 31.0, False, "47% · 31%"),
+        (True, 31.0, False, "47%"),
+        (False, None, False, "47%"),
+        (False, 31.0, True, "47% · 0%"),
+    ],
+)
+def test_muse_menubar_title_and_icon_follow_grok(
+    monkeypatch: pytest.MonkeyPatch,
+    hidden: bool,
+    percent: float | None,
+    reset: bool,
+    expected: str,
+) -> None:
+    state = menubar._empty_state("en")
+    state.hide_claude = state.hide_codex = state.hide_agy = True
+    state.hide_grok = False
+    state.grok_weekly.percent = 47
+    state.hide_muse = hidden
+    state.muse_session.percent = percent
+    state.muse_session.reset_done = reset
+    app = SimpleNamespace(codex_5h_pct=None, _menubar_text_cache={})
+    assert menubar_title._compose_title(app, state) == expected
+    icons: list[str] = []
+
+    def icon(name: str) -> Any:
+        icons.append(name)
+        return None
+
+    monkeypatch.setattr(menubar_title, "_grok_menubar_icon", lambda: icon("grok"))
+    monkeypatch.setattr(menubar_title, "_muse_menubar_icon", lambda: icon("muse"))
+    menubar_title._menubar_attributed_title(app, state)
+    assert icons == (["grok", "muse"] if not hidden and percent is not None else ["grok"])
+
+
+@pytest.mark.parametrize("fetch_fails", [False, True])
+@pytest.mark.parametrize("hide_preference", [False, True])
+def test_refresh_preserves_muse_on_success_and_fetch_error(
+    monkeypatch: pytest.MonkeyPatch,
+    fetch_fails: bool,
+    hide_preference: bool,
+) -> None:
+    from types import SimpleNamespace
+
+    from loaders.claude_usage import PollOutcome, PollState
+    from menubar import agy, grok, muse, refresh, state
+    from tests.test_muse_quota_probe import quota
+
+    projection = muse.project_quota(quota(), "en", 2801, latest_session=1001)
+    assert projection is not None
+    monkeypatch.setattr(refresh, "_hide_muse_enabled", lambda: hide_preference)
+    monkeypatch.setattr(
+        refresh,
+        "get_service_status",
+        lambda config: ServiceStatus(config.service_name, False, "operational", "", "cache"),
+    )
+    monkeypatch.setattr("quota.codex_window_keeper.maybe_ping", lambda _mock: None)
+    monkeypatch.setattr("quota.agy_window_keeper.maybe_ping", lambda *_args: None)
+
+    async def fetch() -> PollOutcome:
+        if fetch_fails:
+            raise OSError("fetch failed")
+        return PollOutcome(PollState.LOADING)
+
+    missing = state._missing_row("Session", state.CODEX_COLOR)
+    app = SimpleNamespace(
+        language="en",
+        mock=True,
+        latest_state=state._empty_state("en"),
+        _load_history_entries=lambda: [],
+        _project_rows=lambda **_kwargs: [],
+        _fetch=fetch,
+        _statusline_setup_available=lambda: False,
+        tracker=SimpleNamespace(group=lambda: 0),
+        burn_rate_trackers={},
+        _history_load_error_key=None,
+    )
+    sources = refresh.RefreshSources(
+        codex_result={"codex_rows": (missing, missing), "codex_5h_pct": None},
+        history_scan=None,
+        agy_result=agy.AgyRefreshResult(None, True),
+        agy_projection=agy.fallback_projection("en"),
+        grok_result=grok.GrokRefreshResult(None, True),
+        grok_projection=grok.fallback_projection("en"),
+        debug_timing=False,
+        muse_result=muse.MuseRefreshResult(projection, False),
+        muse_projection=projection,
+    )
+    result = refresh.build_result(app, sources)["state"]
+    assert result.muse_session == projection.session
+    assert result.muse_weekly == projection.weekly
+    assert result.muse_stale == projection.stale
+    assert result.hide_muse is hide_preference
+
+    if fetch_fails:
+        assert "OSError" in result.status_text
+    else:
+        assert result.status_text == _t("en", "status_text", value=_t("en", "status_no_data"))

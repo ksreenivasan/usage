@@ -20,13 +20,22 @@ collect_ignore = (
     if sys.platform == "darwin"
     else [
         "test_analyzer_pipeline.py",
+        "test_compact_cards.py",
         "test_login_item.py",
         "test_menubar.py",
         "test_menubar_notify.py",
+        "test_muse_review_regressions.py",
         "test_panels.py",
         "test_web_panel_payload.py",
     ]
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_desktop_quota(monkeypatch: pytest.MonkeyPatch) -> None:
+    from loaders import claude_desktop
+
+    monkeypatch.setattr(claude_desktop, "desktop_history_paths", lambda: ())
 
 
 @pytest.fixture(autouse=True)
@@ -64,15 +73,42 @@ def _isolate_muse_sessions(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
 @pytest.fixture(autouse=True)
 def _isolate_user_state_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Keep shared startup workers out of the user's real config directories."""
-    import prefs
-    import service_status
-    import usage_diagnosis_snapshot
-    from analyzer import usage_snapshot
+    from analyzer import diagnosis_snapshot, history_persist, reporter, subscription, usage_snapshot
+    from installer import claude_pane, session_hooks, setup_hook
+    from loaders import cache_quarantine, history_loader
+    from quota import quota_snapshot
+    from usage_common import prefs, service_status
+    from usage_hooks import usage_session_resume
 
     state_dir = tmp_path / "user-state"
+    monkeypatch.setattr(subscription, "CODEX_AUTH", state_dir / "codex" / "auth.json")
+    monkeypatch.setattr(
+        history_loader, "HISTORY_CACHE_PATH", state_dir / "history_jsonl_cache.json"
+    )
+    monkeypatch.setattr(setup_hook, "HOOK_TARGET", state_dir / "claude" / "usage-statusline.py")
+    monkeypatch.setattr(
+        setup_hook, "FORWARDER_TARGET", state_dir / "claude" / "usage-statusline-forwarder.py"
+    )
+    monkeypatch.setattr(history_persist, "STATE_PATH", state_dir / "history_persist_state.json")
+    monkeypatch.setattr(history_persist, "_schedule_next_locked", lambda _delay: None)
+    monkeypatch.setattr(history_persist, "detect_agents", lambda: [])
+    monkeypatch.setattr(reporter, "YEAR_LEDGER_PATH", state_dir / "year_ledger.json")
+    monkeypatch.setattr(reporter, "YEAR_CACHE_PATH", state_dir / "year_cache.json")
+    monkeypatch.setattr(cache_quarantine, "QUARANTINE_DIR", state_dir / "quarantine")
+    monkeypatch.setattr(quota_snapshot, "SNAPSHOT_PATH", state_dir / "quota_snapshot.json")
+    monkeypatch.setattr(
+        session_hooks, "QUOTA_AWARE_HOOK_TARGET", state_dir / "usage-quota-aware.py"
+    )
+    monkeypatch.setattr(claude_pane, "INSTALL_DIR", state_dir / "claude-pane" / "usage-dash")
     monkeypatch.setattr(prefs, "PREFERENCES_FILE", state_dir / "usage-preferences.json")
     monkeypatch.setattr(
-        usage_diagnosis_snapshot,
+        usage_session_resume, "DIAGNOSIS_SNAPSHOT", state_dir / "usage-diagnosis.json"
+    )
+    monkeypatch.setattr(
+        usage_session_resume, "DIAGNOSIS_STATE", state_dir / "usage-diagnosis-state.json"
+    )
+    monkeypatch.setattr(
+        diagnosis_snapshot,
         "SNAPSHOT_PATH",
         state_dir / "usage-diagnosis.json",
     )
@@ -107,12 +143,24 @@ def _isolate_user_state_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
 @pytest.fixture(autouse=True)
 def _isolate_dispatch_ledger_sources(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Keep report builds from reading real Codex/Antigravity sessions and quota caches."""
-    from loaders import agy_loader, agy_quota_probe, codex_loader
+    from adapters import rate_limits
+    from loaders import agy_loader, agy_quota_probe, codex_loader, grok_quota_probe
 
     monkeypatch.setattr(codex_loader, "SESSIONS_DIR", tmp_path / "codex-home" / "sessions")
     monkeypatch.setattr(codex_loader, "LOGS_DB", tmp_path / "codex-home" / "logs_2.sqlite")
+    monkeypatch.setattr(codex_loader, "STATE_DB", tmp_path / "codex-home" / "state_5.sqlite")
+    monkeypatch.setattr(
+        codex_loader, "ARCHIVED_SESSIONS_DIR", tmp_path / "codex-home" / "archived_sessions"
+    )
+    monkeypatch.setattr(codex_loader, "JSONL_CACHE_PATH", tmp_path / "codex_jsonl_cache.json")
+    for name in ("STATUS_FILE", "LEGACY_STATUS_FILE", "TT_STATUS_FILE"):
+        monkeypatch.setattr(rate_limits, name, str(tmp_path / name))
+    monkeypatch.setattr(grok_quota_probe, "GROK_LOG_PATH", tmp_path / "grok-unified.jsonl")
     monkeypatch.setattr(agy_loader, "AGY_SESSIONS_DIR", tmp_path / "agy-conversations")
     monkeypatch.setattr(agy_quota_probe, "CACHE_PATH", tmp_path / "agy_quota_cache.json")
+    monkeypatch.setattr(agy_quota_probe, "AUTH_EXPIRED_PATH", tmp_path / "agy_auth_expired")
+    monkeypatch.setattr(agy_quota_probe, "_TOKEN_PATH", tmp_path / "antigravity-oauth-token")
+    monkeypatch.setattr(agy_quota_probe, "_probe_via_cli", lambda timeout: None)
 
 
 @pytest.fixture(autouse=True)
@@ -170,3 +218,37 @@ def patch_terse_hook_paths(
         return _patch_terse_hook_paths(monkeypatch, tmp_path, **kwargs)
 
     return factory
+
+
+@pytest.fixture(autouse=True)
+def _isolate_keeper_and_trust_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from installer import codex_hook_trust, session_hooks
+    from quota import agy_window_keeper, codex_window_keeper, window_keeper
+
+    monkeypatch.setattr(window_keeper, "WINDOW_KEEPER_STATE_PATH", tmp_path / "keeper.json")
+    monkeypatch.setattr(
+        window_keeper, "KEEPER_CLAUDE_SETTINGS_PATH", tmp_path / "keeper-settings.json"
+    )
+    monkeypatch.setattr(
+        codex_window_keeper, "CODEX_WINDOW_KEEPER_STATE_PATH", tmp_path / "codex-keeper.json"
+    )
+    monkeypatch.setattr(
+        agy_window_keeper, "AGY_WINDOW_KEEPER_STATE_PATH", tmp_path / "agy-keeper.json"
+    )
+    monkeypatch.setattr(session_hooks, "CODEX_HOOKS_JSON", tmp_path / "codex" / "hooks.json")
+    monkeypatch.setattr(codex_hook_trust, "codex_home", lambda: tmp_path / "codex")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_muse_quota(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """No test may launch real Muse or access its shared quota snapshot."""
+    from loaders import muse_quota_probe
+
+    monkeypatch.setattr(muse_quota_probe, "CACHE_PATH", tmp_path / "muse_quota.json")
+    monkeypatch.setattr(muse_quota_probe, "PROBE_DIR", tmp_path / "muse-probe")
+    monkeypatch.setattr(muse_quota_probe, "find_muse", lambda: None)
+    monkeypatch.setattr(muse_quota_probe, "_probe_running", False)
+    monkeypatch.setattr(muse_quota_probe, "_retry_after", 0.0)
+    monkeypatch.setattr(muse_quota_probe, "_last_attempt_session", None)
+    monkeypatch.setattr(muse_quota_probe, "_probe_process", None)
+    monkeypatch.setattr(muse_quota_probe, "_probe_shutdown", False)

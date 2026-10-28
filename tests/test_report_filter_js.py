@@ -169,7 +169,7 @@ function makeEnvironment(
 
   const projectHead = new Element('div', 'rank-head');
   projectHead.append(
-    span('', ''), span('', 'Project'), span('', 'Tokens'), span('', 'Cost')
+    span('', ''), span('', 'Project'), span('', 'Share'), span('', 'Tokens'), span('', 'Cost')
   );
   const projectList = new Element('div', 'rank-list');
   const projectRows = cube.projects.map((name, index) =>
@@ -245,10 +245,12 @@ function makeEnvironment(
     cost: 'Cost',
     costUnpriced: '{tokens} tokens have no public pricing',
     kpiActiveValue: '{active} / {total} days',
+    kpiActiveHint: 'A day counts if any tool records usage',
     emptyModels: 'No models',
     emptyProjects: 'No projects',
     projectSection: 'Projects',
     projectShare: 'Share of project',
+    projectOthers: 'Other projects',
     share: 'Share',
     tokens: 'Tokens',
     vsPrevious: 'vs previous period',
@@ -264,8 +266,10 @@ function makeEnvironment(
     project: 'Project',
     rank: 'Rank',
     startTime: 'Start time',
-    trendCompareDown: 'This week dropped {pct}% vs last week.',
-    trendCompareFirst: 'First week of this period.',
+    trendCompareDown: 'Last complete week (W{week}) dropped {pct}% vs the preceding week.',
+    trendPartialWeek: 'only {days} days',
+    compositionMissing: 'Another {tokens} tokens have no input/output breakdown.',
+    trendCompareFirst: 'Fewer than two complete weeks to compare.',
     trendCompareFlat: 'Roughly flat vs last week.',
     trendCompareNew: 'This week has new usage vs last week.',
     trendCompareUp: 'This week is {ratio}× of last week.',
@@ -394,12 +398,12 @@ assert.deepEqual(
   ['Share of project', 'Share of project']
 );
 assert.deepEqual(details.map((row) => row.querySelector('.cost').textContent), ['$1.25', '—']);
-assert.equal(env.projectHead.children[2].textContent, 'Tokens');
-assert.equal(env.projectHead.children.length, 4);
+assert.equal(env.projectHead.children[3].textContent, 'Tokens');
+assert.equal(env.projectHead.children.length, 5);
 assert.equal(document.querySelectorAll('.project-section .rank-line .name').length, 1);
 env.projectRows[0].fire('click');
 assert.equal(env.projectList.children.length, 1);
-assert.equal(env.projectHead.children[2].textContent, 'Tokens');
+assert.equal(env.projectHead.children[3].textContent, 'Tokens');
 console.log(
   'interaction: tool groups collapsed; click, keyboard, reload, project shares 100.0%; mask safe'
 );
@@ -525,6 +529,10 @@ window.usageReportFilter.applyBounds(rangeSummary.bounds);
 assert.equal(rangeEnv.cards.tokens.querySelector('b').textContent, '≈ 50');
 assert.equal(rangeEnv.cards.tokens.querySelector('i').textContent.split('\n')[0], '50');
 assert.equal(rangeEnv.cards.cost.querySelector('b').textContent, '$5.00');
+assert.equal(
+  rangeEnv.cards.active.querySelector('i').textContent,
+  'A day counts if any tool records usage'
+);
 const sumVisible = (rows, className) => rows
   .map((row) => row.querySelector(className).textContent)
   .reduce((sum, value) => sum + Number(value.replace('$', '')), 0);
@@ -623,13 +631,13 @@ assert.equal(crossYear.tokens, 100);
 assert.equal(crossYear.cost, 1);
 const crossRows = trendRows();
 assert.equal(crossRows.length, 1);
-assert.equal(crossRows[0].querySelector('.week').textContent, 'W1');
+assert.equal(crossRows[0].querySelector('.week').textContent, 'W1 (12/29–01/04)');
 assert.equal(crossRows[0].querySelector('em').textContent, '100');
 assert.equal(crossRows[0].getAttribute('title'), '2025-12-29 – 2026-01-04 · 100 · $1.00');
 assert.equal(crossRows[0].querySelector('.delta').textContent, '');
 assert.equal(
   filterEnv.trendSection.querySelector('.trend-summary').textContent,
-  '→ First week of this period.'
+  '→ Fewer than two complete weeks to compare.'
 );
 const crossLists = filterEnv.compositionSection.querySelectorAll('.rank-list');
 assert.equal(filterEnv.compositionSection.hidden, false);
@@ -689,7 +697,7 @@ assert.equal(emptyDump.includes('Infinity'), false);
 const oneDay = applyFilter('2026-01-05', '2026-01-05');
 assert.equal(oneDay.tokens, 400);
 assert.equal(trendRows().length, 1);
-assert.equal(trendRows()[0].querySelector('.week').textContent, 'W2');
+assert.equal(trendRows()[0].querySelector('.week').textContent, 'W2 (01/05–01/05) · only 1 days');
 assert.equal(trendRows()[0].querySelector('.delta').textContent, 'in progress');
 assert.equal(filterEnv.compositionSection.hidden, false);
 const oneDaySessions = filterEnv.sessionSection.querySelectorAll('tr').slice(1);
@@ -703,16 +711,17 @@ applyFilter('2025-12-28', '2026-01-05');
 const fullRows = trendRows();
 assert.deepEqual(
   fullRows.map((row) => row.querySelector('.week').textContent),
-  ['W52', 'W1', 'W2']
+  ['W52 (12/28–12/28) · only 1 days', 'W1 (12/29–01/04)', 'W2 (01/05–01/05)']
 );
 assert.deepEqual(
   fullRows.map((row) => row.querySelector('em').textContent),
   ['200', '100', '400']
 );
+assert.equal(fullRows[1].querySelector('.delta').textContent, '');
 assert.equal(fullRows[2].querySelector('.delta').textContent, 'in progress');
 assert.equal(
   filterEnv.trendSection.querySelector('.trend-summary').textContent,
-  '→ This week dropped 50% vs last week.'
+  '→ Fewer than two complete weeks to compare.'
 );
 const ranked = filterEnv.sessionSection.querySelectorAll('tr').slice(1);
 assert.deepEqual(ranked.map((row) => row.children[5].textContent), ['400', '100', '50']);
@@ -730,6 +739,35 @@ assert.equal(fullDump.includes('Infinity'), false);
 console.log(
   'filter: isoWeek 2026-W1 cross-year; composition 50/40/10; sessions by cost; csv masked'
 );
+
+
+// Ledger totals affect date-filtered totals, never composition or sessions.
+const ledgerCube = JSON.parse(JSON.stringify(filterCube));
+ledgerCube.rows.push([1, 0, 0, 0, 900, 0, 0, 0, 9, 0, 1]);
+ledgerCube.rows.push([2, 1, 1, 1, 500, 0, 0, 0, 5, 0, 1]);
+const ledgerEnv = run(makeEnvironment(ledgerCube, {}, false, filterSessions));
+const ledgerSummary = window.usageReportFilter.applyBounds({from: '2025-12-29', to: '2026-01-01'});
+assert.equal(ledgerSummary.tokens, 1500);
+assert.equal(ledgerSummary.cost, 15);
+assert.equal(ledgerSummary.sessions, 1);
+assert.equal(ledgerSummary.activeDays, 2);
+const ledgerLists = ledgerEnv.compositionSection.querySelectorAll('.rank-list');
+assert.deepEqual(
+  ledgerLists[0].children.map((row) => [
+    row.querySelector('.name').textContent, row.querySelector('.pct').textContent,
+  ]),
+  [['Input', '50.0%'], ['Cache read', '40.0%'], ['Output', '10.0%']]
+);
+assert.deepEqual(
+  ledgerLists[1].children.map((row) => [
+    row.querySelector('.name').textContent, row.querySelector('.pct').textContent,
+  ]),
+  [['Claude Code', '44.4%'], ['Codex', '—']]
+);
+window.usageReportFilter.applyBounds({from: '2026-01-01', to: '2026-01-01'});
+assert.equal(ledgerEnv.compositionSection.hidden, false);
+assert.equal(ledgerLists[0].children.length, 0);
+console.log('ledger: filtered totals retained; composition, hit rates, sessions unchanged');
 
 const chartCube = {
   dates: ['2026-03-01', '2026-03-02'],
@@ -765,6 +803,53 @@ const pricingModels = chartEnv.pricingSection.querySelector('.pricing-models');
 assert.equal(pricingModels.tagName, 'span');
 assert.equal(pricingModels.textContent, '未知');
 assert.equal(pricingModels.parentNode.className, 'name');
+chart = chartEnv.trendSection.querySelector('.daily-chart-wrap');
+assert.equal(chart.querySelector('.daily-peak-label').textContent, '03-02 · 30');
+assert.equal(chart.querySelectorAll('.daily-x-label').length, 1);
+const manyProjects = {
+  dates: ['2026-05-21'], agents: [{id: 'codex', name: 'Codex'}],
+  models: [{name: 'test', cost_known: true}],
+  projects: Array.from({length: 12}, (_, i) => `p${i}`),
+  rows: Array.from({length: 12}, (_, i) => [0, 0, 0, i, 10, 0, 0, 0, 1, 1]),
+};
+const manyEnv = run(makeEnvironment(manyProjects, {}, true));
+window.usageReportFilter.applyBounds({from: '2026-05-21', to: '2026-05-21'});
+const other = manyEnv.projectList.children.at(-1);
+assert.equal(other.dataset.projectOther, 'true');
+assert.equal(other.querySelector('.name').textContent, 'Other projects');
+assert.equal(other.querySelector('.pct').textContent, '16.7%');
+assert.equal(other.querySelector('.tokens').textContent, '20');
+assert.equal(other.querySelector('.cost').textContent, '$2.00');
+assert.equal(manyEnv.projectList.children.length, 11);
+manyProjects.rows = manyProjects.rows.slice(0, 10);
+const exactEnv = run(makeEnvironment(manyProjects, {}, true));
+window.usageReportFilter.applyBounds({from: '2026-05-21', to: '2026-05-21'});
+assert.equal(exactEnv.projectList.children.length, 10);
+assert.equal(exactEnv.projectList.children.some((row) => row.dataset.projectOther), false);
+const monthDays = Array.from({length: 62}, (_, i) =>
+  new Date(Date.UTC(2026, 0, 31 + i)).toISOString().slice(0, 10));
+const monthCube = {
+  ...manyProjects, dates: monthDays,
+  rows: monthDays.map((_, i) => [i, 0, 0, 0, 1, 0, 0, 0, 0, 1]),
+};
+const monthEnv = run(makeEnvironment(monthCube, {}, true, [], true));
+window.usageReportFilter.applyBounds({from: monthDays[0], to: monthDays.at(-1)});
+const monthChart = monthEnv.trendSection.querySelector('.daily-chart-wrap');
+assert.deepEqual(monthChart.querySelectorAll('.daily-x-label').map((el) => el.textContent),
+  ['01-31', '03-01', '04-02']);
+assert.deepEqual(monthChart.querySelectorAll('.daily-y-label').map((el) => el.textContent),
+  ['2', '1', '0']);
+monthCube.rows = monthCube.rows.map((row) => [...row.slice(0, 4), 0, 0, 0, 0, 0, 1]);
+const zeroChartEnv = run(makeEnvironment(monthCube, {}, true, [], true));
+window.usageReportFilter.applyBounds({from: monthDays[0], to: monthDays.at(-1)});
+assert.ok(zeroChartEnv.trendSection.querySelector('.daily-chart-wrap').querySelector('.empty'));
+for (const [peak, ceiling] of [
+  [1040000000, '1.20B'], [900000000, '1.00B'], [1000000000, '1.20B'], [999, '1.0K'],
+]) {
+  const axisCube = {...chartCube, dates: ['2026-03-01'], rows: [[0, 0, 0, 0, peak, 0, 0, 0, 0, 1]]};
+  const axisEnv = run(makeEnvironment(axisCube, {}, false, [], true));
+  assert.equal(axisEnv.trendSection.querySelector('.daily-y-label').textContent, ceiling);
+}
 console.log('daily chart: date range rebuilds pricing; tokens/cost toggle redraws');
 """
 
@@ -809,5 +894,6 @@ def test_report_filter_javascript_interactions_and_boundaries(tmp_path: Path) ->
         "zero and full child shares: 100.0% + 0.0%; costs remain",
         "range: 50 tokens, $5, 2 sessions; empty/reversed/clamped/no-previous safe",
         "filter: isoWeek 2026-W1 cross-year; composition 50/40/10; sessions by cost; csv masked",
+        "ledger: filtered totals retained; composition, hit rates, sessions unchanged",
         "daily chart: date range rebuilds pricing; tokens/cost toggle redraws",
     ]

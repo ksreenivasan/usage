@@ -27,13 +27,13 @@ from menubar.prefs import (
 from panels.dynamic_height import inject_content_height_script
 from panels.payload import (
     _data_uri,
-    _load_i18n_bundle,
     _load_panel_html,
     _new_state_payload,
     _row_payload,
     _state_payload,
 )
 from panels.window_drag import inject_window_drag_script
+from usage_common.i18n import _load_i18n_bundle
 
 __all__ = [
     "_data_uri",
@@ -109,7 +109,9 @@ def _reload_web_panel(view: Any) -> None:
 
 
 def _is_navigation_menu_item(item: Any) -> bool:
-    item_identifier = getattr(item, "itemIdentifier", None)
+    # WebKit tags its context-menu items through NSMenuItem.identifier();
+    # NSMenuItem has no itemIdentifier, so looking that up removed nothing.
+    item_identifier = getattr(item, "identifier", None)
     if not callable(item_identifier):
         return False
     identifier = item_identifier()
@@ -202,6 +204,8 @@ class UsageScriptBridge(NSObject):
                                 state.agy_session = projection.session
                                 state.agy_weekly = projection.weekly
                                 state.agy_group_name = projection.group_name
+                                state.agy_group_switchable = projection.group_switchable
+                                state.agy_weekly_only = projection.weekly_only
                                 state.agy_stale = projection.stale
                             self.delegate.popover_controller.setState_(state)
                     return
@@ -392,6 +396,7 @@ class HTMLPanel:
     codex_row_height: float
     agy_card_height: float
     grok_card_height: float
+    muse_card_height: float
     status_wrap_extra_height: float
     service_alert_height: float
     dynamic_height: bool
@@ -409,6 +414,7 @@ class HTMLPanel:
         codex_row_height: float = 64.0,
         agy_card_height: float = 0.0,
         grok_card_height: float = 0.0,
+        muse_card_height: float = 0.0,
         status_wrap_extra_height: float = 0.0,
         service_alert_height: float = 0.0,
         dynamic_height: bool = True,
@@ -423,6 +429,7 @@ class HTMLPanel:
         self.codex_row_height = codex_row_height
         self.agy_card_height = agy_card_height
         self.grok_card_height = grok_card_height
+        self.muse_card_height = muse_card_height
         self.status_wrap_extra_height = status_wrap_extra_height
         self.service_alert_height = service_alert_height
         self.dynamic_height = dynamic_height

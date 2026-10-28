@@ -6,7 +6,7 @@ Everything you need to run usage from source, use the TUI / CLI, configure detec
 
 ## How it gets the data
 
-Claude Code and Codex numbers come from local files those tools already write — no Anthropic / OpenAI API calls. Antigravity is the exception: its quota is not on disk, so usage fetches it from Google's quota endpoint using the OAuth credential the Antigravity CLI stores (macOS Keychain / Windows Credential Manager), refreshing the access token via `https://oauth2.googleapis.com/token` when it expires. Beyond that, network access is limited to three things: (1) to estimate Codex costs, usage needs a token pricing table — if no local cache exists (`~/.usage/pricing_cache.json`), usage shows the estimate immediately with a built-in fallback price, then tries to download and cache the public [LiteLLM pricing JSON](https://github.com/BerriAI/litellm) in the background, refreshing it again after 7 days. If the download fails, usage percentage display is unaffected, and pricing updates automatically once the network succeeds. (2) Starting in v0.11.0, usage pings the GitHub Releases API at most once per 24h to check for new versions (toggleable from the "Switch Panel" menu). (3) The public Claude and Codex Statuspage summaries, polled every 5 minutes to raise the service-status banner. The full list of outbound requests lives in [SECURITY.md](../.github/SECURITY.md).
+Claude Code and Codex numbers come from local files those tools already write. Antigravity quota is not on disk, so usage fetches it from Google's quota endpoint using the OAuth credential the Antigravity CLI stores (macOS Keychain / Windows Credential Manager), refreshing the access token via `https://oauth2.googleapis.com/token` when it expires. Other network activity includes: (1) to estimate Codex costs, usage needs a token pricing table — if no local cache exists (`~/.usage/pricing_cache.json`), usage shows the estimate immediately with a built-in fallback price, then tries to download and cache the public [LiteLLM pricing JSON](https://github.com/BerriAI/litellm) in the background, refreshing it again after 7 days. If the download fails, usage percentage display is unaffected, and pricing updates automatically once the network succeeds. (2) Starting in v0.11.0, usage pings the GitHub Releases API at most once per 24h to check for new versions (toggleable from the "⚙ Settings" menu). (3) The public Claude and Codex Statuspage `components.json` feeds, polled every 5 minutes for Claude Code / Claude API and Codex API to raise the service-status banner; `incidents.json` is read only when a watched component is abnormal. The full list of outbound requests lives in [SECURITY.md](../.github/SECURITY.md).
 
 ### Claude Code usage
 
@@ -25,21 +25,23 @@ flowchart LR
     B -->|writes| C[(~/.claude/<br/>usage-status.json)]
     D[usage menu bar / TUI] -->|reads| C
     D -->|renders| E[macOS menu bar]
-    F((Anthropic API)) -.x.- D
-    style F stroke:#c0392b,stroke-dasharray:5 5
 ```
 
 Read priority:
 
 1. `~/.claude/usage-status.json` — written by the hook usage installs.
 2. `~/.claude/usag-status.json` — automatic v0.1.x legacy fallback; new users should not encounter this.
-3. `~/.claude/tt-status.json` — fallback for users migrating from the third-party tool [stormzhang/token-tracker](https://github.com/stormzhang/token-tracker); usage will share its status file. (**Note: unrelated to this project's internal modules; it's purely external-community compat.**)
+3. `~/.claude/tt-status.json` — read-only, migration-only fallback for users coming from the third-party tool [stormzhang/token-tracker](https://github.com/stormzhang/token-tracker).
+4. `cachedUsageUtilization` in `~/.claude.json` — Claude Code's cached quota.
+5. The desktop app's local `plan-usage-history.json` — used when no Claude Code source is usable, without credentials or network access.
+
+The same desktop profile's local HTTP cache can supply exact reset times when its organization and observations match. Missing or unusable cache leaves reset times unknown (`None`); usage never invents them.
 
 ### Codex usage
 
 Codex CLI doesn't expose a statusLine hook, so usage takes a different route: it scans the conversation logs Codex CLI leaves on disk (`~/.codex/sessions/*.jsonl`). Codex writes `rate_limits` data directly into each log entry — usage reads those fields to get the 5-hour and 7-day quota percentages directly. Today's token count and cost are summed from the token usage recorded in the same files.
 
-Note that Codex only writes `rate_limits` into its logs **intermittently** — unlike Claude Code, it has no live status-line reporting — so this number can **lag your real usage** (and anything you do on the web never reaches the local files at all). When the local snapshot is older than 15 minutes, the Codex card shows an "about N minutes ago" tag to flag that it's stale. Staying offline is deliberate: it means usage never burns your tokens.
+Note that Codex only writes `rate_limits` into its logs **intermittently** — unlike Claude Code, it has no live status-line reporting — so this number can **lag your real usage** (and anything you do on the web never reaches the local files at all). When the local snapshot is older than 15 minutes, the Codex card shows an "about N minutes ago" tag to flag that it's stale.
 
 If Codex isn't installed or the directory doesn't exist, that part of the UI hides itself and Claude Code stats continue to work normally.
 
@@ -78,7 +80,7 @@ python3 main.py --setup
 What `--setup` does in detail:
 
 - Configures `tui.status_line` in `~/.codex/config.toml` when Codex is detected.
-- If Claude Code is present, copies `usage_statusline.py` to `~/.claude/usage-statusline.py`.
+- If Claude Code is present, copies `usage_hooks/usage_statusline.py` to `~/.claude/usage-statusline.py`.
 - If Claude Code is present, points `statusLine` in `~/.claude/settings.json` at that hook.
 - If you already had a custom Claude Code `statusLine`, it is backed up to `settings.usage.previousStatusLine` so nothing is overwritten.
 
@@ -117,7 +119,7 @@ python3 main.py
   2. A projects card listing the top three projects by usage. Click the button in the top-right corner to cycle between today / 7-day / monthly views.
   3. A footer card showing current rate, sync status, and today's token usage and cost estimate (Claude uses the actual `costUSD` from its log when available; Codex cost is estimated from token count × pricing table).
   4. Two buttons: "Refresh now" and "Quit".
-- **Panel**: click the **Switch Panel** button in the top-right corner to change panel styles. Fourteen built-in panels are available — **Default** (clean light cards), **Matrix** (neon green digital rain), **Windows 95** (retro Win95 interface), **Vintage Newspaper** (aged newsprint), **Cloud Observation** (weather-station glass cards), **Midnight Aquarium** (deep-sea animation), **Prism Arcade** (rainbow holographic animation), **Black Hole** (rotating accretion disk), **Stained Glass** (irregular color fields behind leaded dividers, turning like a kaleidoscope under a light sweep), **Origami** (the same layout folded into monochrome triangular paper planes), **Migration** (a dusk sky where V-shaped flocks cross a latitude-and-longitude grid under route labels), **Catppuccin** (the official palette, all four flavors), **World Cup 2026** — FIFA broadcast HUD with a green pitch, stick-figure players that chase and kick the ball, and bidirectional duel bars instead of standard progress bars — and **Lepidoptera**, a blueprint-style butterfly specimen board with drifting wing animations. World Cup 2026 is Claude-vs-Codex only and has no Antigravity card or drag-to-reorder.
+- **Panel**: click the **⚙ Settings** button in the top-right corner and pick **Switch Panel** to change panel styles. Sixteen built-in panels are available — **Default** (clean light cards), **Matrix** (neon green digital rain), **Windows 95** (retro Win95 interface), **Vintage Newspaper** (aged newsprint), **Cloud Observation** (weather-station glass cards), **Midnight Aquarium** (deep-sea animation), **Prism Arcade** (rainbow holographic animation), **Black Hole** (rotating accretion disk), **Stained Glass** (irregular color fields behind leaded dividers, turning like a kaleidoscope under a light sweep), **Origami** (the same layout folded into monochrome triangular paper planes), **Sketchbook**, **Heart Monitor**, **Migration** (a dusk sky where V-shaped flocks cross a latitude-and-longitude grid under route labels), **Catppuccin** (the official palette, all four flavors), **World Cup 2026** — FIFA broadcast HUD with a green pitch, stick-figure players that chase and kick the ball, and bidirectional duel bars instead of standard progress bars — and **Lepidoptera**, a blueprint-style butterfly specimen board with drifting wing animations. World Cup 2026 is Claude-vs-Codex only and has no Antigravity card or drag-to-reorder.
 
   <p align="center">
     <img src="matrix.en.png" alt="matrix panel" width="220">
@@ -128,7 +130,7 @@ python3 main.py
   </p>
 
   Your choice is persisted via `NSUserDefaults`, so the last selected panel survives restarts.
-- **Update check (v0.11.0+)**: On launch, usage pings GitHub Releases for a newer version (rate-limited to once per 24h so you're not nagged every time you open the app). When a newer version is found, an alert shows the version + release notes with three buttons: **Download / Later / Skip this version**. The "Switch Panel" menu has **Automatically Check for Updates** (toggleable) and **Check for Updates Now** entries.
+- **Update check (v0.11.0+)**: On launch, usage pings GitHub Releases for a newer version (rate-limited to once per 24h so you're not nagged every time you open the app). When a newer version is found, an alert shows the version + release notes with three buttons: **Download / Later / Skip this version**. The "⚙ Settings" menu has **Automatically Check for Updates** (toggleable) and **Check for Updates Now** entries.
 - **Permissions:** on first launch, macOS may ask whether to allow background execution. Click Allow.
 
 ### Terminal TUI mode
@@ -148,7 +150,7 @@ Press `Ctrl+C` to exit.
 
 ## Reports and deep analytics (CLI)
 
-Beyond the menu bar and TUI, there's an analytics CLI entrypoint `usage_cli.py` for exporting HTML reports or running an interactive terminal dashboard:
+Beyond the menu bar and TUI, there's an analytics CLI entrypoint `usage_app/cli.py` for exporting HTML reports or running an interactive terminal dashboard:
 
 <p align="center">
   <img src="report.en.png" alt="HTML report screen: Your AI Usage Recap" width="520">
@@ -158,31 +160,31 @@ Beyond the menu bar and TUI, there's an analytics CLI entrypoint `usage_cli.py` 
 source .venv/bin/activate
 
 # Interactive dashboard (auto-detects Claude / Codex; arrow keys switch between agents)
-python3 usage_cli.py
+uv run usage
 
 # Single-agent dashboard
-python3 usage_cli.py claude
-python3 usage_cli.py codex
+uv run usage claude
+uv run usage codex
 
 # Generate an HTML report and open it in your default browser (default range: last 30 days)
-python3 usage_cli.py report
-python3 usage_cli.py report --today              # today
-python3 usage_cli.py report --week               # this week
-python3 usage_cli.py report --month              # this month
-python3 usage_cli.py report --all                # all data
-python3 usage_cli.py report --out report.html    # save to a specific path
+uv run usage report
+uv run usage report --today              # today
+uv run usage report --week               # this week
+uv run usage report --month              # this month
+uv run usage report --all                # all data
+uv run usage report --out report.html    # save to a specific path
 
 # Plain-text tabular stats
-python3 usage_cli.py daily
-python3 usage_cli.py weekly
-python3 usage_cli.py monthly
+uv run usage daily
+uv run usage weekly
+uv run usage monthly
 ```
 
 The HTML report covers daily / weekly / monthly token + cost trends, per-project rankings, and top-model distribution. The top-right Share button lets you save a copy as `.html` or copy the file path to send via AirDrop / Mail / Slack / iMessage — recipients open it in any browser. The built-in "Hide project names" toggle (on by default, privacy-first) swaps every project name to `Project 1 / Project 2 / ...` before the file is saved, while the on-screen view is unaffected.
 
 ## Quota status for other tools (`usage status`)
 
-`usage status` prints the current Claude Code and Codex quota so other tools can read it. It only reads the same local files the menu bar uses — no network call, and Antigravity is deliberately excluded because its quota needs one.
+`usage status` prints the current Claude Code and Codex quota so other tools can read it. It reads the same local files the menu bar uses. JSON also includes the Antigravity cache and Grok local billing log; the text summary stays unchanged. No network requests are made.
 
 ```bash
 # One-line human-readable summary
@@ -208,16 +210,44 @@ The JSON carries a `schema_version` so consumers can guard against future change
       "updated_at": "2026-08-14T06:52:00Z",
       "age_seconds": 480
     },
-    "codex": { "available": true, "five_hour": { "used_percent": null, "resets_at": null, "resets_in_seconds": null }, "seven_day": { "used_percent": 21.0, "resets_at": 1787196910, "resets_in_seconds": 506110 }, "model": "", "updated_at": "2026-08-14T06:52:23Z", "age_seconds": 457 }
+    "codex": { "available": true, "five_hour": { "used_percent": null, "resets_at": null, "resets_in_seconds": null }, "seven_day": { "used_percent": 21.0, "resets_at": 1787196910, "resets_in_seconds": 506110 }, "model": "", "updated_at": "2026-08-14T06:52:23Z", "age_seconds": 457 },
+    "antigravity": {
+      "available": true,
+      "groups": [
+        { "name": "GEMINI MODELS", "five_hour": { "used_percent": 23.7, "resets_in_seconds": 4980 }, "seven_day": { "used_percent": 53.9, "resets_in_seconds": 222180 } }
+      ],
+      "updated_at": "2026-08-14T06:58:00Z",
+      "age_seconds": 120
+    },
+    "grok": {
+      "available": true,
+      "period": { "used_percent": 28.0, "resets_at": 1786873200, "resets_in_seconds": 176000 },
+      "tier": "XPremium",
+      "updated_at": "2026-08-14T06:59:30Z",
+      "age_seconds": 30
+    },
+    "muse": {
+      "available": true,
+      "five_hour": { "used_percent": 24.0, "resets_at": 1786701600, "resets_in_seconds": 10800 },
+      "seven_day": { "used_percent": 42.0, "resets_at": 1787036400, "resets_in_seconds": 345600 },
+      "updated_at": "2026-08-14T06:59:00Z",
+      "age_seconds": 60
+    }
   }
 }
 ```
+
+Muse reads only `~/.usage/muse_quota.json`; status never runs a Muse probe. `window` maps to `five_hour`, `weekly` to `seven_day`, and `checked_at` to UTC `updated_at`. Missing or invalid snapshots report `available: false` with `reason: "no_data"`, including when Muse is not installed. Valid stale snapshots remain readable; reset countdowns stop at zero.
 
 `resets_in_seconds` counts down from `generated_at` to `resets_at` (floored at `0`), and `age_seconds` is how old `updated_at` was at `generated_at`; both are `null` when their source field is.
 
 An agent with no readable data yet reports `"available": false` with null fields, and the command still exits `0` — missing data is not an error. A window that the provider doesn't report is `null` rather than absent, so consumers never have to guard against a missing key.
 
-If you installed from source, either run it as `python3 usage_cli.py status --json` or `uv sync` once to get the `usage` command on your PATH.
+Unavailable agents also include `reason`: `no_data` when the loader returns nothing, `error` when it raises, or (Antigravity only) `not_signed_in` when both cached quota and the CLI OAuth token file are absent. Available agents stay unchanged; this additive field keeps `schema_version` at `1`.
+
+Antigravity preserves cache order in `groups`, maps `weekly` to `seven_day`, and computes `used_percent` as `100 - remaining_percent`, rounded to one decimal. Its countdown uses cached `fetched_at` plus `resets_in_minutes`, minus the current time, floored at `0`; an unknown reset is `null`. Grok converts `period_end` to Unix seconds in `period.resets_at` and exposes `subscription_tier` as `tier` (`null` when absent). Both preserve the original `fetched_at` string as `updated_at`; stale cache data remains readable with elapsed countdowns at zero. When unavailable, both use the complete Claude/Codex unavailable field shape.
+
+If you installed from source, either run it as `uv run usage status --json` or `uv sync` once to get the `usage` command on your PATH.
 
 ### Starship
 
@@ -244,7 +274,7 @@ set -g status-right '#(usage status --json | jq -r ".agents[\"claude-code\"].sev
 
 A LaunchAgent (the macOS service that handles "what should start when this user logs in") makes usage start automatically.
 
-**Easiest way:** click the menu bar icon to open the popover, press the "⇄ Switch Panel" button, and tick "Launch at Login" at the bottom of the menu. Works for both the .app and source builds — no Terminal needed.
+**Easiest way:** click the menu bar icon to open the popover, press the "⚙ Settings" button, and tick "Launch at Login" at the bottom of the menu. Works for both the .app and source builds — no Terminal needed.
 
 The script below is an alternative install method for source users:
 
@@ -319,7 +349,7 @@ USAGE_LANG=zh-CN python3 main.py   # Simplified Chinese
 
 ## Behaviour notes
 
-- usage reads `~/.claude/usage-status.json`, the v0.1.x legacy `~/.claude/usag-status.json`, `~/.claude/tt-status.json`, and Codex's session files locally, and never calls the Anthropic or OpenAI LLM APIs to do it. Network activity beyond that: (a) if you use Antigravity, its quota comes from Google's official quota endpoint using the OAuth credential the Antigravity CLI already stores — read from macOS Keychain, Windows Credential Manager, or a local token file depending on CLI version — a metadata call that doesn't consume model quota; (b) public Claude and Codex Statuspage.io pages to flag outages; (c) a one-time download of the LiteLLM pricing table for cost estimates (cached for 7 days; offline fallback available); (d) starting in v0.11.0, an at-most-daily ping to the GitHub Releases API to check for new versions (toggleable from the "Switch Panel" menu).
+- usage reads `~/.claude/usage-status.json`, the v0.1.x legacy `~/.claude/usag-status.json`, `~/.claude/tt-status.json`, and Codex's session files locally. Network activity includes: (a) if you use Antigravity, its quota comes from Google's official quota endpoint using the OAuth credential the Antigravity CLI already stores — read from macOS Keychain, Windows Credential Manager, or a local token file depending on CLI version — a quota metadata call; (b) public Claude and Codex Statuspage.io pages to flag outages; (c) a one-time download of the LiteLLM pricing table for cost estimates (cached for 7 days; offline fallback available); (d) starting in v0.11.0, an at-most-daily ping to the GitHub Releases API to check for new versions (toggleable from the "⚙ Settings" menu).
 - When Claude Code isn't running, the status file isn't updated — but actual usage isn't changing either (until reset time), so the displayed value is still accurate. After reset time passes, it auto-resets to zero.
 - If the status file hasn't been updated for more than 6 hours, the status message shows `⚠ usage stale Nm` (where N is the actual minute count) to flag potentially out-of-date numbers.
 

@@ -20,7 +20,7 @@ from typing import Any
 
 import pytest
 
-import usage_statusline
+from usage_hooks import usage_statusline
 
 
 @pytest.mark.parametrize(
@@ -172,7 +172,8 @@ def _isolate_context_burn_and_preferences_files(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Isolate the context-burn and preferences files for each test."""
+    """Isolate the context-burn, mix and preferences files for each test."""
+    monkeypatch.setattr(usage_statusline, "MIX_DIR", str(tmp_path / "mix"))
     monkeypatch.setattr(
         usage_statusline,
         "CONTEXT_BURN_FILE",
@@ -762,7 +763,7 @@ def test_render_outputs_multiline_colored_statusline(
     assert "$" not in output  # cost line removed in v0.10.0
 
 
-def test_render_shows_prompt_cache_hit_with_countdown(
+def test_render_shows_prompt_cache_hit_without_countdown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("TT_LANG", "zh_TW")
@@ -773,10 +774,8 @@ def test_render_shows_prompt_cache_hit_with_countdown(
         "cost": {"total_duration_ms": 720000},
         "prompt_cache": {
             "caching_observed": True,
-            "warm": True,
             "hit_ratio": 0.9072975151245158,
             "expires_at": now.timestamp() + 43 * 60,
-            "recache_tokens_if_cold": 180_000,
         },
     }
 
@@ -785,88 +784,8 @@ def test_render_shows_prompt_cache_hit_with_countdown(
     line3 = output.splitlines()[0]
     assert "快取:" in line3
     assert "91%" in line3
-    assert "(剩43min)" in line3
-    assert "已冷" not in line3
+    assert "43min" not in line3
     assert "\033[2m\033[38;5;111m" in line3
-
-
-@pytest.mark.parametrize(
-    ("lang", "warm", "expires_offset", "expected"),
-    [
-        ("zh-TW", False, -1, "已冷·下輪重寫 180k"),
-        ("en", False, -1, "cold·re-cache 180k"),
-        ("zh-TW", None, -1, "已冷·下輪重寫 180k"),
-        ("zh-TW", True, 0, "已冷·下輪重寫 180k"),
-        ("zh-TW", False, 60, "已冷·下輪重寫 180k"),
-    ],
-)
-def test_render_shows_recache_tokens_when_prompt_cache_is_cold(
-    monkeypatch: pytest.MonkeyPatch,
-    lang: str,
-    warm: bool | None,
-    expires_offset: int,
-    expected: str,
-) -> None:
-    monkeypatch.setenv("USAGE_LANG", lang)
-    monkeypatch.setattr(usage_statusline, "get_width", lambda: 116)
-    now = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
-    prompt_cache: dict[str, object] = {
-        "caching_observed": True,
-        "hit_ratio": 0.9,
-        "expires_at": now.timestamp() + expires_offset,
-        "recache_tokens_if_cold": 180_000,
-    }
-    if warm is not None:
-        prompt_cache["warm"] = warm
-
-    output = usage_statusline.render({"prompt_cache": prompt_cache}, now)
-
-    assert "90%" in output
-    assert f" ({expected})" in output
-    assert "剩" not in output
-    assert "left" not in output
-    assert f"{usage_statusline.C['dim']}{usage_statusline.C['magenta']} ({expected})" in output
-
-
-@pytest.mark.parametrize("recache_tokens", [None, 0, True, "180000"])
-def test_render_omits_recache_text_for_invalid_token_counts(
-    monkeypatch: pytest.MonkeyPatch,
-    recache_tokens: object,
-) -> None:
-    monkeypatch.setenv("USAGE_LANG", "zh-TW")
-    monkeypatch.setattr(usage_statusline, "get_width", lambda: 116)
-    now = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
-    output = usage_statusline.render(
-        {
-            "prompt_cache": {
-                "caching_observed": True,
-                "warm": False,
-                "hit_ratio": 0.9,
-                "expires_at": now.timestamp() - 1,
-                "recache_tokens_if_cold": recache_tokens,
-            }
-        },
-        now,
-    )
-
-    assert "快取:" in output
-    assert "(" not in output
-    assert "已冷" not in output
-
-
-def test_render_omits_recache_text_when_token_count_is_missing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("USAGE_LANG", "zh-TW")
-    monkeypatch.setattr(usage_statusline, "get_width", lambda: 116)
-    now = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
-    output = usage_statusline.render(
-        {"prompt_cache": {"caching_observed": True, "warm": False, "hit_ratio": 0.9}},
-        now,
-    )
-
-    assert "快取:" in output
-    assert "(" not in output
 
 
 @pytest.mark.parametrize(
@@ -958,15 +877,177 @@ def test_render_prompt_cache_degrades_for_narrow_widths(
     }
 
     monkeypatch.setattr(usage_statusline, "get_width", lambda: 29)
-    bar_only = usage_statusline.render(payload, now)
-    assert "Session:" not in bar_only
-    assert "Cache:" in bar_only
-    assert "43min" not in bar_only
+    pct_only = usage_statusline.render(payload, now)
+    assert "Session:" not in pct_only
+    assert "Cache:" in pct_only
+    assert "43min" not in pct_only
 
-    monkeypatch.setattr(usage_statusline, "get_width", lambda: 18)
+    monkeypatch.setattr(usage_statusline, "get_width", lambda: 17)
     without_cache = usage_statusline.render(payload, now)
     assert "Session:" not in without_cache
     assert "Cache:" not in without_cache
+
+
+@pytest.mark.parametrize("age", (0, 30, 600))
+def test_render_shows_recent_cache_miss(monkeypatch: pytest.MonkeyPatch, age: int) -> None:
+    monkeypatch.setenv("TT_LANG", "zh_TW")
+    monkeypatch.setattr(usage_statusline, "get_width", lambda: 116)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+
+    output = usage_statusline.render(
+        {
+            "prompt_cache": {
+                "caching_observed": True,
+                "hit_ratio": 0.62,
+                "last_miss_at": now.timestamp() - age,
+                "last_miss_cause": {"causes": ["tools_changed"]},
+            }
+        },
+        now,
+    )
+
+    assert "62%" in output
+    assert "\033[2m\033[38;5;111m剛失效:工具換了\033[0m" in output
+
+
+@pytest.mark.parametrize("last_miss_at", (1767224999, 1767225601, None, "1767225600", True))
+def test_render_omits_cache_miss_with_invalid_or_old_time(
+    monkeypatch: pytest.MonkeyPatch, last_miss_at: object
+) -> None:
+    monkeypatch.setenv("TT_LANG", "zh_TW")
+    monkeypatch.setattr(usage_statusline, "get_width", lambda: 116)
+
+    output = usage_statusline.render(
+        {
+            "prompt_cache": {
+                "caching_observed": True,
+                "hit_ratio": 0.62,
+                "last_miss_at": last_miss_at,
+                "last_miss_cause": {"causes": ["tools_changed"]},
+            }
+        },
+        datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    assert "快取:" in output
+    assert "62%" in output
+    assert "剛失效:" not in output
+
+
+@pytest.mark.parametrize(
+    "last_miss_cause",
+    (
+        None,
+        "tools_changed",
+        {"causes": "tools_changed"},
+        {"causes": ["unknown"]},
+        {"causes": ["unrecognized"]},
+        {"causes": [None, {}]},
+    ),
+)
+def test_render_omits_unrecognized_cache_miss(
+    monkeypatch: pytest.MonkeyPatch, last_miss_cause: object
+) -> None:
+    monkeypatch.setenv("TT_LANG", "zh_TW")
+    monkeypatch.setattr(usage_statusline, "get_width", lambda: 116)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+
+    output = usage_statusline.render(
+        {
+            "prompt_cache": {
+                "caching_observed": True,
+                "hit_ratio": 0.62,
+                "last_miss_at": now.timestamp(),
+                "last_miss_cause": last_miss_cause,
+            }
+        },
+        now,
+    )
+
+    assert "快取:" in output
+    assert "62%" in output
+    assert "剛失效:" not in output
+
+
+def test_render_cache_miss_uses_first_recognized_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TT_LANG", "zh_TW")
+    monkeypatch.setattr(usage_statusline, "get_width", lambda: 116)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+
+    output = usage_statusline.render(
+        {
+            "prompt_cache": {
+                "caching_observed": True,
+                "hit_ratio": 0.62,
+                "last_miss_at": now.timestamp(),
+                "last_miss_cause": {"causes": ["unknown", "effort_changed", "tools_changed"]},
+            }
+        },
+        now,
+    )
+
+    assert "剛失效:換了思考強度" in output
+    assert "工具換了" not in output
+
+
+def test_render_drops_cache_miss_before_duration_or_percentage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TT_LANG", "zh_TW")
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    payload = {
+        "cost": {"total_duration_ms": 720000},
+        "prompt_cache": {
+            "caching_observed": True,
+            "hit_ratio": 0.62,
+            "last_miss_at": now.timestamp(),
+            "last_miss_cause": {"causes": ["tools_changed"]},
+        },
+    }
+    monkeypatch.setattr(usage_statusline, "get_width", lambda: 116)
+    full = usage_statusline.render(payload, now)
+    width = usage_statusline.vlen(full) - usage_statusline.vlen(" 剛失效:工具換了")
+    monkeypatch.setattr(usage_statusline, "get_width", lambda: width)
+
+    output = usage_statusline.render(payload, now)
+
+    assert "剛失效:" not in output
+    assert "快取:" in output
+    assert "62%" in output
+    assert "會話時長:" in output
+    assert usage_statusline.vlen(output) == width
+
+
+@pytest.mark.parametrize("lang", ("zh-TW", "zh-CN", "en", "ja", "ko"))
+def test_cache_miss_translation_keys(lang: str) -> None:
+    causes = (
+        "system_prompt_changed",
+        "tools_changed",
+        "model_changed",
+        "fast_mode_changed",
+        "cache_scope_or_ttl_changed",
+        "betas_changed",
+        "effort_changed",
+        "thinking_mode_changed",
+        "thinking_display_changed",
+        "auto_mode_changed",
+        "overage_changed",
+        "extra_body_changed",
+        "defer_loading_changed",
+        "messages_rewritten",
+        "ttl_expired_5m",
+        "ttl_expired_1h",
+        "likely_server_side",
+    )
+    translations = usage_statusline.STATUSLINE_TRANSLATIONS[lang]
+
+    assert translations["cache_miss"]
+    assert {key for key in translations if key.startswith("miss_")} == {
+        f"miss_{cause}" for cause in causes
+    }
+    assert all(translations[f"miss_{cause}"] for cause in causes)
 
 
 def test_render_skips_bad_rate_limit_percentage_without_fallback(
@@ -1209,3 +1290,286 @@ def test_main_prints_fallback_when_render_fails(
 
     assert status_file.exists()
     assert capsys.readouterr().out == "usage\n"
+
+
+@pytest.mark.parametrize(
+    ("percent", "size", "tokens", "color"),
+    [
+        (25, 1_000_000, None, 214),
+        (45, 1_000_000, None, 160),
+        (40, 200_000, None, 42),
+        (19, 1_000_000, None, 42),
+        (20, 1_000_000, None, 214),
+        (39, 1_000_000, None, 214),
+        (40, 1_000_000, None, 160),
+        (50, 200_000, None, 214),
+        (80, 200_000, None, 160),
+        (40, None, None, 42),
+        (50, None, None, 214),
+        (80, None, None, 160),
+        (10, 1_000_000, 900_000, 42),
+    ],
+)
+def test_context_color_uses_worse_threshold_without_changing_quota(
+    monkeypatch: pytest.MonkeyPatch,
+    percent: int,
+    size: int | None,
+    tokens: object,
+    color: int,
+) -> None:
+    monkeypatch.setenv("USAGE_LANG", "en")
+    monkeypatch.setattr(usage_statusline, "get_width", lambda: 116)
+    context: dict[str, Any] = {"used_percentage": percent}
+    if size is not None:
+        context["context_window_size"] = size
+    if tokens is not None:
+        context["total_input_tokens"] = tokens
+    payload = {
+        "context_window": context,
+        "rate_limits": {"five_hour": {"used_percentage": 25}},
+    }
+    output = usage_statusline.render(payload, datetime(2026, 1, 1, tzinfo=UTC))
+    assert f"Context:{usage_statusline.C['reset']}\033[38;5;{color}m" in output
+    assert f"5h:{usage_statusline.C['reset']}\033[38;5;42m" in output
+
+
+def _mix_record(*blocks: dict[str, Any], **fields: Any) -> bytes:
+    return (
+        json.dumps({"type": "user", "message": {"content": list(blocks)}, **fields}) + "\n"
+    ).encode()
+
+
+def test_mix_counts_images_text_sidechains_and_compaction(tmp_path: Path) -> None:
+    transcript = tmp_path / "session.jsonl"
+    image = {"type": "image", "source": {"data": "not-measured"}}
+    tool = {"type": "tool_result", "content": [{"type": "text", "text": "中文abcd"}, image]}
+    transcript.write_bytes(
+        _mix_record(image, image, tool)
+        + _mix_record(image, tool, isSidechain=True)
+        + _mix_record(image, type="assistant")
+    )
+    data = {"session_id": "one", "transcript_path": str(transcript)}
+    mix = usage_statusline.read_mix(data)
+    assert mix is not None
+    assert (mix["images"], mix["toolTokens"]) == (3, 3)
+    assert mix["offset"] == transcript.stat().st_size
+    assert json.loads((Path(usage_statusline.MIX_DIR) / "one.json").read_text()) == mix
+    with transcript.open("ab") as target:
+        target.write(b'{"type":"system","subtype":"compact_boundary"}\n')
+        target.write(_mix_record(tool))
+    mix = usage_statusline.read_mix(data)
+    assert mix is not None
+    assert (mix["images"], mix["toolTokens"]) == (1, 3)
+    with transcript.open("ab") as target:
+        target.write(_mix_record(image, isCompactSummary=True))
+        target.write(_mix_record({"type": "tool_result", "content": "abcdefgh"}))
+    mix = usage_statusline.read_mix(data)
+    assert mix is not None
+    assert (mix["images"], mix["toolTokens"]) == (0, 2)
+
+
+def test_mix_incremental_reads_only_new_complete_lines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transcript = tmp_path / "session.jsonl"
+    image = _mix_record({"type": "image"})
+    transcript.write_bytes(image)
+    data = {"session_id": "one", "transcript_path": str(transcript)}
+    assert usage_statusline.read_mix(data)["images"] == 1  # type: ignore[index]
+    original_open = open
+    reads: list[int] = []
+
+    class Tracked:
+        def __enter__(self) -> Any:
+            self.source = original_open(transcript, "rb")
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            self.source.close()
+
+        def fileno(self) -> int:
+            return self.source.fileno()
+
+        def seek(self, offset: int) -> None:
+            self.source.seek(offset)
+
+        def read(self, size: int) -> bytes:
+            reads.append(size)
+            return self.source.read(size)
+
+    def tracked_open(path: Any, mode: str = "r", **kwargs: Any) -> Any:
+        return (
+            Tracked()
+            if str(path) == str(transcript) and mode == "rb"
+            else original_open(path, mode, **kwargs)
+        )
+
+    monkeypatch.setattr(usage_statusline, "open", tracked_open, raising=False)
+    assert usage_statusline.read_mix(data)["images"] == 1  # type: ignore[index]
+    assert reads == [0]
+    with transcript.open("ab") as target:
+        target.write(image + image[:-1])
+    mix = usage_statusline.read_mix(data)
+    assert mix is not None
+    assert (mix["offset"], mix["images"]) == (len(image) * 2, 2)
+    with transcript.open("ab") as target:
+        target.write(b"\n")
+    mix = usage_statusline.read_mix(data)
+    assert mix is not None
+    assert (mix["offset"], mix["images"]) == (len(image) * 3, 3)
+
+
+def test_mix_restarts_on_replaced_or_truncated_transcript(tmp_path: Path) -> None:
+    transcript = tmp_path / "first.jsonl"
+    image = _mix_record({"type": "image"})
+    transcript.write_bytes(image * 2)
+    data = {"session_id": "one", "transcript_path": str(transcript)}
+    assert usage_statusline.read_mix(data)["images"] == 2  # type: ignore[index]
+    transcript.write_bytes(image)
+    assert usage_statusline.read_mix(data)["images"] == 1  # type: ignore[index]
+    other = tmp_path / "second.jsonl"
+    other.write_bytes(image * 3)
+    data["transcript_path"] = str(other)
+    assert usage_statusline.read_mix(data)["images"] == 3  # type: ignore[index]
+
+
+def test_mix_catches_up_within_the_read_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transcript = tmp_path / "session.jsonl"
+    image = _mix_record({"type": "image"})
+    long_tool = _mix_record({"type": "tool_result", "content": "x" * 400})
+    transcript.write_bytes(image * 3 + long_tool)
+    monkeypatch.setattr(usage_statusline, "MIX_READ_BUDGET", len(image) * 2)
+    data = {"session_id": "one", "transcript_path": str(transcript)}
+    mix = usage_statusline.read_mix(data)
+    assert mix is not None
+    assert (mix["images"], mix["offset"], mix["complete"]) == (2, len(image) * 2, False)
+    mix = usage_statusline.read_mix(data)
+    assert mix is not None
+    assert (mix["images"], mix["offset"], mix["complete"]) == (3, len(image) * 3, False)
+    # The record longer than the budget is read whole in one run.
+    mix = usage_statusline.read_mix(data)
+    assert mix is not None
+    assert (mix["toolTokens"], mix["complete"]) == (100, True)
+    assert mix["offset"] == transcript.stat().st_size
+
+
+def test_render_mix_label_waits_until_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("USAGE_LANG", "en")
+    monkeypatch.setattr(usage_statusline, "get_width", lambda: 200)
+    transcript = tmp_path / "session.jsonl"
+    image = _mix_record({"type": "image"})
+    transcript.write_bytes(image * 2)
+    monkeypatch.setattr(usage_statusline, "MIX_READ_BUDGET", len(image))
+    payload = {
+        "session_id": "one",
+        "transcript_path": str(transcript),
+        "context_window": {"used_percentage": 30, "context_window_size": 1_000_000},
+    }
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    assert "Images" not in usage_statusline.render(payload, now)
+    assert "Images 2" in usage_statusline.render(payload, now)
+
+
+@pytest.mark.parametrize("session_id", ("../escape", "", "a/b", "a.json"))
+def test_mix_rejects_invalid_ids(session_id: str, tmp_path: Path) -> None:
+    assert (
+        usage_statusline.read_mix(
+            {"session_id": session_id, "transcript_path": str(tmp_path / "missing")}
+        )
+        is None
+    )
+    assert not Path(usage_statusline.MIX_DIR).exists()
+
+
+@pytest.mark.parametrize("bad", (b"broken\n", b"null\n", b"\xff\n", b"[1]\n"))
+def test_mix_skips_torn_lines(bad: bytes, tmp_path: Path) -> None:
+    transcript = tmp_path / "one.jsonl"
+    image = _mix_record({"type": "image"})
+    transcript.write_bytes(image + bad + image)
+    data = {"session_id": "one", "transcript_path": str(transcript)}
+    mix = usage_statusline.read_mix(data)
+    assert mix is not None
+    assert (mix["images"], mix["offset"], mix["complete"]) == (2, transcript.stat().st_size, True)
+
+
+@pytest.mark.parametrize("cache_text", ("broken", "null", '{"sessionId": "one"}'))
+def test_mix_restarts_from_a_corrupt_cache(cache_text: str, tmp_path: Path) -> None:
+    transcript = tmp_path / "one.jsonl"
+    transcript.write_bytes(_mix_record({"type": "image"}))
+    cache = Path(usage_statusline.MIX_DIR) / "one.json"
+    cache.parent.mkdir(parents=True)
+    cache.write_text(cache_text)
+    mix = usage_statusline.read_mix({"session_id": "one", "transcript_path": str(transcript)})
+    assert mix is not None
+    assert (mix["images"], mix["complete"]) == (1, True)
+    assert json.loads(cache.read_text()) == mix
+
+
+@pytest.mark.parametrize("percent,images,visible", ((30, 3, True), (50, 0, True), (19, 3, False)))
+def test_render_mix_label(
+    percent: int, images: int, visible: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TT_LANG", "zh-TW")
+    monkeypatch.setattr(usage_statusline, "get_width", lambda: 300)
+    transcript = tmp_path / "one.jsonl"
+    transcript.write_bytes(
+        _mix_record(
+            *([{"type": "image"}] * images), {"type": "tool_result", "content": "a" * 480000}
+        )
+    )
+    data = {
+        "session_id": "one",
+        "transcript_path": str(transcript),
+        "context_window": {"used_percentage": percent, "context_window_size": 1000000},
+    }
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    output = usage_statusline.render(data, now)
+    assert ("讀檔與指令輸出" in output) is visible
+    assert ("圖片 3 張" in output) is (visible and images > 0)
+    if percent == 30:
+        assert "讀檔與指令輸出 40%" in output
+    if not visible:
+        assert output == usage_statusline.render({"context_window": data["context_window"]}, now)
+    monkeypatch.setattr(usage_statusline, "get_width", lambda: 20)
+    assert "讀檔與指令輸出" not in usage_statusline.render(data, now)
+
+
+def test_render_drops_mix_label_before_the_context_bar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("USAGE_LANG", "zh-TW")
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_bytes(_mix_record({"type": "image"}, {"type": "image"}))
+    payload = {
+        "session_id": "one",
+        "transcript_path": str(transcript),
+        "context_window": {"used_percentage": 30, "context_window_size": 1_000_000},
+        "cost": {"total_duration_ms": 3_600_000},
+        "model": {"display_name": "Opus 5.5"},
+    }
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    monkeypatch.setattr(usage_statusline, "get_width", lambda: 90)
+    assert "/ 1.0M" in usage_statusline.render(payload, now)
+    assert "圖片 2 張" in usage_statusline.render(payload, now)
+    monkeypatch.setattr(usage_statusline, "get_width", lambda: 60)
+    narrow = usage_statusline.render(payload, now)
+    assert "/ 1.0M" in narrow
+    assert "圖片 2 張" not in narrow
+
+
+def test_mix_sweeps_stale_files_when_a_new_session_starts(tmp_path: Path) -> None:
+    mix_dir = Path(usage_statusline.MIX_DIR)
+    mix_dir.mkdir(parents=True)
+    old, fresh = mix_dir / "old.json", mix_dir / "fresh.json"
+    old.write_text("{}")
+    fresh.write_text("{}")
+    week_ago = time.time() - usage_statusline.MIX_STALE_SECONDS - 60
+    os.utime(old, (week_ago, week_ago))
+    transcript = tmp_path / "one.jsonl"
+    transcript.write_bytes(_mix_record({"type": "image"}))
+    assert usage_statusline.read_mix({"session_id": "one", "transcript_path": str(transcript)})
+    assert sorted(p.name for p in mix_dir.iterdir()) == ["fresh.json", "one.json"]

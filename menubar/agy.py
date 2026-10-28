@@ -9,15 +9,15 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import cast
 
 import quota.burn_rate as burn_rate
-from i18n import _t
 from loaders.agy_quota_probe import (
     AgyQuotaGroup,
     AgyQuotaResult,
     AgyQuotaWindow,
+    auth_expired,
     load_quota,
 )
 from loaders.agy_quota_probe import (
@@ -38,6 +38,7 @@ from quota.burn_rate import (
     BurnRateTracker,
     assess_weekly_quota,
 )
+from usage_common.i18n import _t
 from usage_common.time_utils import parse_iso8601_utc_or_raise
 
 AGY_STALE_SECONDS = 20 * 60
@@ -56,6 +57,8 @@ class AgyQuotaProjection:
     weekly: QuotaRowState
     stale: AgyStaleState | None
     five_hour: AgyQuotaWindow | None
+    group_switchable: bool = False
+    weekly_only: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,9 +82,10 @@ def project_quota(
     preferred = next(
         (group for group in quota.groups if _matches_group(group.name, group_preference)), None
     )
+    fallback_groups = [group for group in quota.groups if not _matches_group(group.name, "argon")]
     selected = preferred or next(
-        (group for group in quota.groups if "gemini" in group.name.lower()),
-        min(quota.groups, key=_group_remaining_percent),
+        (group for group in quota.groups if _matches_group(group.name, "gemini")),
+        min(fallback_groups or quota.groups, key=_group_remaining_percent),
     )
     current_time = time.time() if now is None else now
     age_minutes = _cache_age_minutes(quota.fetched_at, current_time)
@@ -96,9 +100,13 @@ def project_quota(
         else:
             session_tracker = burn_rate_trackers["agy_session"]
             weekly_tracker = burn_rate_trackers["agy_weekly"]
-            if session_tracker.last_timestamp is None or sample_ts > session_tracker.last_timestamp:
+            if selected.five_hour is not None and (
+                session_tracker.last_timestamp is None or sample_ts > session_tracker.last_timestamp
+            ):
                 session_tracker.record(sample_ts, 100.0 - _remaining_percent(selected.five_hour))
-            if weekly_tracker.last_timestamp is None or sample_ts > weekly_tracker.last_timestamp:
+            if selected.weekly is not None and (
+                weekly_tracker.last_timestamp is None or sample_ts > weekly_tracker.last_timestamp
+            ):
                 weekly_tracker.record(sample_ts, 100.0 - _remaining_percent(selected.weekly))
             # agy samples arrive every 5 minutes, so the default 10-minute window
             # cannot collect MIN_FORECAST_SAMPLES; this wider window reacts more slowly.
@@ -110,24 +118,46 @@ def project_quota(
                 window_seconds=burn_rate.ROLLING_WINDOW_SECONDS,
                 min_span_seconds=AGY_WEEKLY_FORECAST_MIN_SPAN_SECONDS,
             )
+    session = _window_row(
+        _t(language, "session_label"),
+        selected.five_hour,
+        language,
+        age_minutes,
+        forecast_seconds=session_forecast,
+    )
+    weekly = _window_row(
+        _t(language, "weekly_label"),
+        selected.weekly,
+        language,
+        age_minutes,
+        forecast_seconds=weekly_forecast,
+        warning_max_seconds=AGY_WEEKLY_WARNING_MAX_SECONDS,
+        window_seconds=WEEKLY_WINDOW_SECONDS,
+    )
+    # Google pauses the 5-hour bucket once the weekly one is spent; showing it
+    # as "full" reads as usable, so say it is paused instead.
+    if (
+        selected.weekly is not None
+        and _remaining_percent(selected.weekly) == 0.0
+        and not weekly.reset_done
+    ):
+        session = replace(
+            session,
+            percent_text=_t(language, "agy_session_paused"),
+            reset_text=_t(language, "agy_session_paused_detail"),
+        )
+    if _matches_group(selected.name, "argon"):
+        session = replace(
+            session,
+            percent_text="--",
+            reset_text=_t(language, "agy_argon_weekly_only"),
+        )
     return AgyQuotaProjection(
         group_name=selected.name,
-        session=_window_row(
-            _t(language, "session_label"),
-            selected.five_hour,
-            language,
-            age_minutes,
-            forecast_seconds=session_forecast,
-        ),
-        weekly=_window_row(
-            _t(language, "weekly_label"),
-            selected.weekly,
-            language,
-            age_minutes,
-            forecast_seconds=weekly_forecast,
-            warning_max_seconds=AGY_WEEKLY_WARNING_MAX_SECONDS,
-            window_seconds=WEEKLY_WINDOW_SECONDS,
-        ),
+        group_switchable=len(quota.groups) >= 2,
+        weekly_only=_matches_group(selected.name, "argon"),
+        session=session,
+        weekly=weekly,
         stale=stale,
         five_hour=selected.five_hour,
     )
@@ -170,17 +200,30 @@ def reproject_cached_quota(
     )
 
 
+def quota_group_keys() -> list[str]:
+    """Available toggle targets from the last quota, shared by both panel hosts."""
+    quota = _last_quota
+    return [
+        key
+        for key in ("gemini", "claude_gpt", "argon")
+        if quota is not None and any(_matches_group(group.name, key) for group in quota.groups)
+    ]
+
+
 def _matches_group(name: str, preference: str) -> bool:
     normalized = name.lower()
     if preference == "claude_gpt":
         return "claude" in normalized and "gpt" in normalized
-    return "gemini" in normalized
+    if preference == "argon":
+        return "argon" in normalized
+    return "gemini" in normalized and "argon" not in normalized
 
 
 def fallback_projection(language: str) -> AgyQuotaProjection:
     """Return inert rows while the card is hidden after an unavailable probe."""
     return AgyQuotaProjection(
         group_name="",
+        group_switchable=False,
         session=QuotaRowState(
             title=_t(language, "session_label"),
             percent=None,
@@ -204,8 +247,12 @@ def fallback_projection(language: str) -> AgyQuotaProjection:
 
 def _group_remaining_percent(group: AgyQuotaGroup) -> float:
     return min(
-        _remaining_percent(group.five_hour),
-        _remaining_percent(group.weekly),
+        (
+            _remaining_percent(window)
+            for window in (group.five_hour, group.weekly)
+            if window is not None
+        ),
+        default=100.0,
     )
 
 
@@ -213,35 +260,52 @@ def _remaining_percent(window: AgyQuotaWindow) -> float:
     return max(0.0, min(100.0, float(window.remaining_percent)))
 
 
-def _cache_age_minutes(fetched_at: str, now: float) -> int:
-    """Whole minutes since the cached snapshot was taken (never negative)."""
+def _cache_age_minutes(fetched_at: str, now: float) -> float:
+    """Minutes since the cached snapshot was taken (never negative)."""
     try:
         age_seconds = now - parse_iso8601_utc_or_raise(fetched_at).timestamp()
     except (TypeError, ValueError):
         return 0
-    return max(0, int(age_seconds // 60))
+    return max(0.0, age_seconds / 60)
 
 
 def _window_row(
     title: str,
-    window: AgyQuotaWindow,
+    window: AgyQuotaWindow | None,
     language: str,
-    age_minutes: int = 0,
+    age_minutes: float = 0,
     forecast_seconds: float | None = None,
     warning_max_seconds: float | None = None,
     *,
     window_seconds: float | None = None,
 ) -> QuotaRowState:
+    if window is None:
+        return QuotaRowState(
+            title=title,
+            available=False,
+            percent=None,
+            percent_text="--",
+            reset_text=_t(language, "agy_window_not_reported"),
+            color=AGY_COLOR,
+        )
     remaining = _remaining_percent(window)
     used = 100.0 - remaining
     warning = False
     warning_seconds: float | None = None
-    if remaining == 100.0:
+    reset_done = window.resets_in_minutes is not None and window.resets_in_minutes <= max(
+        0, age_minutes
+    )
+    if reset_done:
+        used = 0.0
+        reset_text = _t(language, "reset_done")
+    elif remaining == 100.0:
         reset_text = _t(language, "agy_quota_full")
     elif window.resets_in_minutes is None:
         reset_text = _t(language, "reset_placeholder")
+    elif window.resets_in_minutes - max(0, age_minutes) < 1:
+        reset_text = _t(language, "reset_imminent")
     else:
-        minutes_left = max(1, window.resets_in_minutes - max(0, age_minutes))
+        minutes_left = window.resets_in_minutes - int(max(0, age_minutes))
         time_to_reset = minutes_left * 60
         if window_seconds is None:
             if (
@@ -275,16 +339,22 @@ def _window_row(
             )
     return QuotaRowState(
         title=title,
-        percent=used,
+        percent=100.0 - remaining,
         percent_text=_t(language, "percent_used", value=_format_percent(used)),
         reset_text=reset_text,
         color=_bar_color(used, AGY_COLOR),
         warning=warning,
         available=True,
+        reset_done=reset_done,
     )
 
 
 def _stale_state(fetched_at: str, now: float, language: str) -> AgyStaleState | None:
+    if auth_expired():
+        return {
+            "ageText": _t(language, "agy_signin_expired"),
+            "tooltip": _t(language, "agy_signin_expired_tooltip"),
+        }
     try:
         age_seconds = now - parse_iso8601_utc_or_raise(fetched_at).timestamp()
     except (TypeError, ValueError):

@@ -12,14 +12,13 @@ import math
 import os
 import threading
 import time
-import tomllib
 import webbrowser
 from collections import deque
 from collections.abc import Callable
+from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from enum import IntEnum
-from importlib import metadata
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
@@ -27,44 +26,53 @@ from uuid import UUID
 import quota.agy_window_keeper as agy_window_keeper
 import quota.codex_window_keeper as codex_window_keeper
 import quota.window_keeper as window_keeper
-import service_status
-import usage_diagnosis_snapshot
-from i18n import _t
+from analyzer import diagnosis_snapshot, history_persist
 from installer.statusline_settings import _statusline_enabled, _toggle_statusline_settings
-from loaders import codex_loader, grok_loader
+from loaders import codex_loader, grok_loader, muse_loader
+from loaders.claude_usage import ClaudeUsageClient, PollState
 from loaders.history_loader import UsageEntry, load_entries
 from menubar import agy as menubar_agy
 from menubar import grok as menubar_grok
+from menubar import manual_refresh
+from menubar import muse as menubar_muse
 from menubar import state as menubar_state
 from menubar.prefs import (
-    _auto_update_check_enabled,
     _hide_agy_enabled,
     _hide_claude_enabled,
     _hide_codex_enabled,
     _hide_grok_enabled,
+    _hide_muse_enabled,
     _panel_flavor,
     _quota_card_order,
     _quota_notification_thresholds,
     _quota_notifications_enabled,
     _save_agy_quota_group,
     _save_panel_flavor,
+    _save_quota_card_order,
     _window_keeper_enabled,
 )
+from panels.catalog import PANEL_SPECS
 from panels.dynamic_height import clamp_content_height, inject_content_height_script
 from panels.panel_scale import MIN_PANEL_SCALE, fit_panel_size, fit_scale
-from panels.payload import _load_panel_html, _state_payload
-from prefs import _load_preferences, _save_preferences
-from pricing import calculate_cost
+from panels.payload import _load_panel_html, _state_payload, resolve_resource
+from quota import quota_snapshot
 from quota.burn_rate import BurnRateTracker
+from quota.notifications import NotificationEvent, QuotaNotifier
 from quota.usage_rate import UsageRateTracker
 from updates import checker as update_checker
 from updates import gate as update_gate
-from updates.release_notes import format_release_notes
-from usage_client import ClaudeUsageClient, PollState
+from updates.release_notes import alert_release_notes
+from usage_common import service_status
+from usage_common.app_version import current_version as _current_version
+from usage_common.i18n import _t
+from usage_common.prefs import _load_preferences, _save_preferences
+from usage_common.pricing import calculate_cost
 from usage_common.usage_lang import detect_lang
-from usage_notifications import NotificationEvent, QuotaNotifier
 from wintray import login_item as win_login_item
 from wintray import menu as wintray_menu
+from wintray.prefs import TrayProvider, load_tray_provider, save_tray_provider
+from wintray.quota_label import TaskbarQuotaLabel, label_enabled, request_tray_menu
+from wintray.taskbar_menu import install_tray_menu
 from wintray.watch import (
     WindowsFileEventChanges,
     WindowsUsageWatcher,
@@ -76,58 +84,93 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Private DLL objects keep signatures isolated from pywebview's ctypes functions.
+_user32: Any = None
+_kernel32: Any = None
+if os.name == "nt":
+    _win_dll: Any = getattr(ctypes, "WinDLL")  # noqa: B009
+    _user32 = _win_dll("user32", use_last_error=True)
+    _kernel32 = _win_dll("kernel32", use_last_error=True)
+    _user32.GetDpiForWindow.argtypes = [wintypes.HWND]
+    _user32.GetDpiForWindow.restype = wintypes.UINT
+    _user32.SetWindowPos.argtypes = [
+        wintypes.HWND,
+        wintypes.HWND,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.UINT,
+    ]
+    _user32.SetWindowPos.restype = wintypes.BOOL
+    _kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+    _kernel32.CreateMutexW.restype = wintypes.HANDLE
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+
+
+def _tray_icon_class() -> type[Any]:
+    import pystray
+
+    if os.name != "nt":
+        return pystray.Icon  # type: ignore[no-any-return]
+
+    class _WindowsTrayIcon(pystray.Icon):  # type: ignore[misc]
+        """Serialize native HICON access across refresh and tray message threads."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self._native_icon_lock = threading.RLock()
+            super().__init__(*args, **kwargs)
+
+        def _show(self) -> None:
+            with self._native_icon_lock:
+                super()._show()
+
+        def _hide(self) -> None:
+            with self._native_icon_lock:
+                super()._hide()
+
+        def _update_icon(self) -> None:
+            with self._native_icon_lock:
+                super()._update_icon()
+
+        def _update_title(self) -> None:
+            with self._native_icon_lock:
+                super()._update_title()
+
+        def _release_icon(self) -> None:
+            with self._native_icon_lock:
+                super()._release_icon()
+
+        def _on_display_change(self, wparam: Any, lparam: Any) -> None:
+            with self._native_icon_lock:
+                super()._on_display_change(wparam, lparam)
+
+        def _on_taskbarcreated(self, wparam: Any, lparam: Any) -> None:
+            with self._native_icon_lock:
+                super()._on_taskbarcreated(wparam, lparam)
+
+    return _WindowsTrayIcon
+
+
 SLOW_POLL_INTERVAL_S = 300
 HISTORY_SCAN_CACHE_SECONDS = 30.0
 UPDATE_ALERT_BODY_LIMIT = 2000
 # szTip is 128 WCHARs including the terminator; pystray raises ValueError past that.
 TOOLTIP_MAX_LENGTH = 127
 PANEL_WIDTH = 380
+# Abnormal exits reuse one dir; pywebview private mode deletes on clean exit: subdir, never ~/.usage
+_WEBVIEW_STORAGE_DIR = Path.home() / ".usage" / "webview"
 _TOAST_AUMID = "com.lollapalooza.usage"
 _TOAST_OPEN_PANEL_ACTION = "open_panel"
-WINDOWS_PANELS = (
-    ("classic", "panel_default_name", "classic.html"),
-    ("matrix", "panel_matrix", "matrix.html"),
-    ("win95", "panel_win95", "win95.html"),
-    ("newspaper", "panel_newspaper", "newspaper.html"),
-    ("cloud_observation", "panel_cloud_observation", "cloud_observation.html"),
-    ("aquarium", "panel_aquarium", "aquarium.html"),
-    ("prism_arcade", "panel_prism_arcade", "prism_arcade.html"),
-    ("black_hole", "panel_black_hole", "black_hole.html"),
-    ("lepidoptera", "panel_lepidoptera", "lepidoptera.html"),
-    ("world_cup", "panel_world_cup", "world_cup.html"),
-    ("stained_glass", "panel_stained_glass", "stained_glass.html"),
-    ("migration", "panel_migration", "migration.html"),
-    ("sketchbook", "panel_sketchbook", "sketchbook.html"),
-    ("heart_monitor", "panel_heart_monitor", "heart_monitor.html"),
-    ("origami", "panel_origami", "origami.html"),
-    ("catppuccin", "panel_catppuccin", "catppuccin.html"),
-)
-# These are only the initial-placeholder fallback used before the WebView
-# reports its real content height (see panel_height()); kept in sync with
-# panels/__init__.py's Mac heights from 64a7c0b (Recalibrate HTML panel
-# heights and status-wrap growth) so the brief pre-measurement window isn't
-# ~17-24pt too tall.
-PANEL_HEIGHTS = {
-    "classic": 1132,
-    "matrix": 1174,
-    "win95": 1183,
-    "newspaper": 1179,
-    "cloud_observation": 1134,
-    "aquarium": 1134,
-    "prism_arcade": 1134,
-    "black_hole": 1134,
-    "lepidoptera": 1174,
-    "world_cup": 812,
-    "stained_glass": 1132,
-    "migration": 1132,
-    "sketchbook": 1132,
-    "heart_monitor": 1132,
-    "origami": 1132,
-    "catppuccin": 1166,
-}
+WINDOWS_PANELS = tuple((spec.id, spec.i18n_key, spec.html_filename) for spec in PANEL_SPECS)
+# Initial fallback heights until the WebView reports its actual content height.
+# Most Windows installs have no Muse CLI, so the fallback leaves that card out.
+PANEL_HEIGHTS = {spec.id: int(spec.height - spec.muse_card_height) for spec in PANEL_SPECS}
 
-TRAY_UNKNOWN_COLOR = (110, 118, 129, 255)
-TRAY_NORMAL_COLOR = (244, 145, 100, 255)
+# Bright fills keep the dark numerals readable on both Windows taskbar themes.
+TRAY_UNKNOWN_COLOR = (125, 211, 252, 255)
+TRAY_NORMAL_COLOR = (45, 212, 191, 255)
 TRAY_PAUSED_COLOR = (255, 196, 57, 255)
 TRAY_ERROR_COLOR = (255, 69, 58, 255)
 
@@ -225,11 +268,14 @@ window.webkit.messageHandlers.usage = {
     var row = document.createElement('button');
     row.type = 'button';
     row.className = 'usage-panel-menu-item';
-    row.setAttribute('role', 'menuitemcheckbox');
+    row.setAttribute('role', item.radio ? 'menuitemradio' : 'menuitemcheckbox');
+    row.setAttribute('aria-checked', String(!!item.checked));
     row.textContent = (item.checked ? '✓  ' : '    ') + item.label;
+    if (item.tooltip) row.title = item.tooltip;
     row.addEventListener('click', function() {
       var extra = item.panelId ? { panel_id: item.panelId } :
-        item.preferenceKey ? { preference_key: item.preferenceKey } : undefined;
+        item.preferenceKey ? { preference_key: item.preferenceKey } :
+        item.provider ? { provider: item.provider } : undefined;
       post(item.action, extra);
       closeMenu();
     });
@@ -274,7 +320,7 @@ document.addEventListener('pointerdown', function(event) {
   var target = event.target;
   var card = target && target.closest && target.closest(
     '[data-card="claude"], [data-card="codex"], [data-card="agy"], '
-    + '[data-card="grok"]'
+    + '[data-card="grok"], [data-card="muse"]'
   );
   var interactive = target && target.closest && target.closest(
     'button, a, input, select, textarea, label, summary, [contenteditable], '
@@ -564,9 +610,13 @@ def _set_taskbar_progress(
             ole32.CoUninitialize()
 
 
-def build_tooltip(state: menubar_state.PopoverState) -> str:
+def build_tooltip(state: menubar_state.PopoverState, provider: TrayProvider = "claude") -> str:
     def line(name: str, row: menubar_state.QuotaRowState) -> str:
-        used = "--" if row.percent is None else str(min(100, max(0, round(row.percent))))
+        used = (
+            "--"
+            if row.display_percent is None
+            else str(min(100, max(0, round(row.display_percent))))
+        )
         return f"{name} {row.title}: {used}%"
 
     lines = [
@@ -575,6 +625,10 @@ def build_tooltip(state: menubar_state.PopoverState) -> str:
         f"{line('Codex', state.codex_session)} · "
         f"{line('Codex', state.codex_weekly).removeprefix('Codex ')}",
     ]
+    if not state.codex_session.title and state.codex_session.percent is None:
+        lines[1] = line("Codex", state.codex_weekly)
+    if provider == "codex":
+        lines.reverse()
     if not state.hide_agy:
         lines.append(
             f"{line('Antigravity', state.agy_session)} · "
@@ -582,8 +636,20 @@ def build_tooltip(state: menubar_state.PopoverState) -> str:
         )
     if not state.hide_grok:
         lines.append(line("Grok", state.grok_weekly))
+    if not state.hide_muse:
+        lines.append(
+            f"{line(_t(state.language, 'muse_name'), state.muse_session)} · "
+            f"{line('', state.muse_weekly).strip()}"
+        )
     text = "\n".join(lines)
     return text if len(text) <= TOOLTIP_MAX_LENGTH else text[:126] + "…"
+
+
+def draw_app_icon() -> Image:
+    from PIL import Image
+
+    with Image.open(resolve_resource("usage.ico")) as image:
+        return image.convert("RGBA").resize((64, 64))
 
 
 def draw_tray_icon(used_percent: float | None) -> Image:
@@ -604,12 +670,17 @@ def draw_tray_icon(used_percent: float | None) -> Image:
     return image
 
 
+def _without_power_glyph(text: str) -> str:
+    """Windows fonts lack U+23FB."""
+    return text.replace("⏻ ", "")
+
+
 def panel_html(filename: str) -> str:
     html = _load_panel_html(filename)
     html = html.replace("{{PANEL_FLAVOR}}", _panel_flavor())
     html = inject_content_height_script(html)
     marker = "<head>"
-    return html.replace(marker, f"{marker}\n{JS_SHIM}", 1)
+    return _without_power_glyph(html.replace(marker, f"{marker}\n{JS_SHIM}", 1))
 
 
 def _active_panel_id() -> str:
@@ -624,47 +695,21 @@ def _save_active_panel_id(panel_id: str) -> None:
     _save_preferences(preferences)
 
 
-def _current_version() -> str:
-    try:
-        return metadata.version("usage-cli")
-    except metadata.PackageNotFoundError:
-        from i18n import packaged_resource_path
-
-        pyproject = packaged_resource_path(
-            "pyproject.toml", Path(__file__).with_name("pyproject.toml")
-        )
-        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-        value = data["project"]["version"]
-        return str(value)
-
-
-def _statusline_payload(language: str) -> dict[str, object]:
-    return {
-        "enabled": _statusline_enabled(),
-        "enabledText": _t(language, "cli_enabled"),
-        "disabledText": _t(language, "cli_disabled"),
-    }
-
-
-def _today_text(entries: list[UsageEntry], language: str) -> str:
+def _today_total(entries: list[UsageEntry]) -> menubar_state.PeriodTotal:
     today = datetime.now().astimezone().date()
     selected = [entry for entry in entries if entry.timestamp.astimezone().date() == today]
-    return _t(
-        language,
-        "today_text",
-        cost=f"{sum(calculate_cost(entry) for entry in selected):.2f}",
-        tokens=f"{sum(entry.total_tokens for entry in selected):,}",
+    return menubar_state.PeriodTotal(
+        tokens=sum(entry.total_tokens for entry in selected),
+        cost=sum(calculate_cost(entry) for entry in selected),
     )
 
 
-def _yesterday_text(entries: list[UsageEntry], language: str) -> str:
+def _yesterday_total(entries: list[UsageEntry]) -> menubar_state.PeriodTotal:
     yesterday = datetime.now().astimezone().date() - timedelta(days=1)
     selected = [entry for entry in entries if entry.timestamp.astimezone().date() == yesterday]
-    return _t(
-        language,
-        "yesterday_text",
-        cost=f"{sum(calculate_cost(entry) for entry in selected):.2f}",
-        tokens=f"{sum(entry.total_tokens for entry in selected):,}",
+    return menubar_state.PeriodTotal(
+        tokens=sum(entry.total_tokens for entry in selected),
+        cost=sum(calculate_cost(entry) for entry in selected),
     )
 
 
@@ -717,6 +762,10 @@ class _WindowsTrayController:
         self.interval = max(30, interval)
         self.language = detect_lang()
         self.active_panel_id = _active_panel_id()
+        self.tray_provider = load_tray_provider()
+        self.quota_label_enabled = label_enabled()
+        self.quota_label: TaskbarQuotaLabel | None = None
+        self._native_ready = False
         self._switch_pending: bool = False
         self.latest_state = self._empty_state()
         self.tracker = UsageRateTracker(mock=mock)
@@ -744,6 +793,7 @@ class _WindowsTrayController:
         self._file_event_refresh_timer: threading.Timer | None = None
         self._last_file_event_refresh_started_at: float | None = None
         self._history_source_tracker = menubar_state.HistorySourceTracker()
+        self._auto_check_schedule = update_gate.AutoCheckSchedule()
         self._quota_notifier = QuotaNotifier(_quota_notification_thresholds())
         self.usage_client = ClaudeUsageClient(mock=mock)
         self._last_tray_percent: float | None = None
@@ -786,6 +836,7 @@ class _WindowsTrayController:
                 _t(self.language, "weekly_label"), menubar_state.AGY_COLOR, self.language
             ),
             agy_group_name="",
+            agy_group_switchable=False,
             grok_weekly=missing(
                 _t(self.language, "weekly_label"), menubar_state.GROK_COLOR, self.language
             ),
@@ -796,9 +847,8 @@ class _WindowsTrayController:
             projects_all=[],
             rate_text=_t(self.language, "rate_text", value="--"),
             status_text=_t(self.language, "status_text", value=_t(self.language, "status_loading")),
-            today_text=_t(self.language, "today_text", cost="0.00", tokens="0"),
-            yesterday_text=_t(self.language, "yesterday_text", cost="0.00", tokens="0"),
-            statusline=_statusline_payload(self.language),
+            today_total=menubar_state.PeriodTotal(),
+            yesterday_total=menubar_state.PeriodTotal(),
             hide_claude=_hide_claude_enabled(),
             hide_codex=_hide_codex_enabled(),
             hide_agy=_hide_agy_enabled(),
@@ -835,20 +885,18 @@ class _WindowsTrayController:
             self._place_window()
 
     def _apply_panel_zoom(self, scale: float, *, scroll: bool = False) -> bool:
-        if self.window is not None and hasattr(self.window, "evaluate_js"):
-            try:
-                result = self.window.evaluate_js(
-                    "typeof window.usageApplyPanelZoom === 'function' && "
-                    f"window.usageApplyPanelZoom({scale}, {self.panel_height()}"
-                    f"{', true' if scroll else ''})"
-                )
-                return result is True
-            except Exception:
-                logger.exception("Unable to apply panel zoom")
+        if self.window is None:
             return False
-        # Lightweight window doubles do not embed a browser. There is no DOM
-        # to scale, so geometry-only tests can proceed normally.
-        return self.window is not None
+        try:
+            result = self.window.evaluate_js(
+                "typeof window.usageApplyPanelZoom === 'function' && "
+                f"window.usageApplyPanelZoom({scale}, {self.panel_height()}"
+                f"{', true' if scroll else ''})"
+            )
+            return result is True
+        except Exception:
+            logger.exception("Unable to apply panel zoom")
+        return False
 
     def attach(self, icon: Any, window: Any) -> None:
         self.icon = icon
@@ -859,15 +907,21 @@ class _WindowsTrayController:
         self.refresh()
 
     def _startup_maintenance(self) -> None:
-        usage_diagnosis_snapshot.maybe_schedule_refresh()
+        from installer import claude_pane
+
+        try:
+            claude_pane.refresh_claude_pane()
+        except (OSError, SystemExit):
+            logger.warning("Claude Code pane refresh failed", exc_info=True)
+        diagnosis_snapshot.maybe_schedule_refresh()
+        history_persist.maybe_schedule_refresh()
         self._clear_stale_update_cache()
-        self._check_update_in_background(
-            manual=False,
-            ignore_cooldown=False,
-            ignore_skipped=False,
-        )
+        if self._auto_check_schedule.try_begin(time.time()):
+            self._run_auto_update_check()
 
     def on_loaded(self) -> None:
+        self._native_ready = True
+        self._sync_quota_label()
         # pywebview's resize()/move() call SetWindowPos with SWP_SHOWWINDOW,
         # so placing the window while it is hidden would drag the bare panel
         # onto the screen. Placement happens in show_panel() instead; here it
@@ -877,7 +931,7 @@ class _WindowsTrayController:
             self.inject_state(force=True)
             # A panel reload can recreate its taskbar button. Reapply the
             # latest value once the visible native window has loaded.
-            self._update_taskbar_progress(self.latest_state.claude_session.percent)
+            self._update_taskbar_progress(self._tray_percent())
 
     @staticmethod
     def _screen_rectangle(value: object) -> tuple[int, int, int, int] | None:
@@ -965,13 +1019,11 @@ class _WindowsTrayController:
         if os.name != "nt":
             return None
         try:
-            library_name = "windll"
-            windll: Any = getattr(ctypes, library_name)
-            user32 = windll.user32
+            user32 = _user32
             native = self.window.native
             handle = native.Handle
-            to_int32 = getattr(handle, "ToInt32", None)
-            hwnd = to_int32() if callable(to_int32) else int(handle)
+            to_int64 = getattr(handle, "ToInt64", None)
+            hwnd = to_int64() if callable(to_int64) else int(handle)
             dpi = int(user32.GetDpiForWindow(hwnd))
         except Exception:
             try:
@@ -1014,12 +1066,11 @@ class _WindowsTrayController:
         if scale is None:
             return False
         try:
-            windll: Any = getattr(ctypes, "windll")  # noqa: B009
-            user32 = windll.user32
+            user32 = _user32
             native = self.window.native
             handle = native.Handle
-            to_int32 = getattr(handle, "ToInt32", None)
-            hwnd = to_int32() if callable(to_int32) else int(handle)
+            to_int64 = getattr(handle, "ToInt64", None)
+            hwnd = to_int64() if callable(to_int64) else int(handle)
             return bool(
                 user32.SetWindowPos(
                     hwnd,
@@ -1329,10 +1380,6 @@ class _WindowsTrayController:
         window = self.window
         if window is None:
             return False
-        if not hasattr(window, "native"):
-            # Lightweight test doubles have no native control and execute synchronously.
-            self._drain_window_mutations()
-            return True
         native = window.native
         if native is None:
             # The tray can receive a click before pywebview has created its Form.
@@ -1393,6 +1440,9 @@ class _WindowsTrayController:
                 self.interval if self.visible else max(self.interval, SLOW_POLL_INTERVAL_S)
             ):
                 self.refresh()
+                self._clear_stale_update_cache()
+                if self._auto_check_schedule.try_begin(time.time()):
+                    threading.Thread(target=self._run_auto_update_check, daemon=True).start()
         finally:
             if self._poll_thread is current_thread:
                 self._poll_thread = None
@@ -1447,6 +1497,17 @@ class _WindowsTrayController:
             self._last_file_event_refresh_started_at = time.monotonic()
         self.refresh()
 
+    def refresh_manual(self) -> None:
+        with self.refresh_lock:
+            if self.stopping.is_set():
+                return
+            manual_refresh.begin(self.latest_state, queued=self._refresh_in_flight)
+        try:
+            if self.visible:
+                self.inject_state()
+        finally:
+            self.refresh()
+
     def refresh(self) -> None:
         with self.refresh_lock:
             if self.stopping.is_set():
@@ -1473,10 +1534,16 @@ class _WindowsTrayController:
 
         while True:
             try:
-                self.latest_state = self._build_state(
+                state = self._build_state(
                     measure=measure,
                     debug_timing=debug_timing,
                 )
+                with self.refresh_lock:
+                    self.latest_state = manual_refresh.finish(
+                        self.latest_state, state, queued=self._refresh_queued
+                    )
+                if not self.mock:
+                    quota_snapshot.write_snapshot()
                 self._process_quota_notifications(self.latest_state)
                 started_at = time.monotonic() if debug_timing else 0.0
                 self._update_tray()
@@ -1486,6 +1553,15 @@ class _WindowsTrayController:
                     self.inject_state()
                     measure("inject_state", started_at)
             except Exception:
+                with self.refresh_lock:
+                    manual_refresh.finish(
+                        self.latest_state, self.latest_state, queued=self._refresh_queued
+                    )
+                if self.visible:
+                    try:
+                        self.inject_state()
+                    except Exception:
+                        logger.warning("Windows tray refresh status update failed", exc_info=True)
                 if os.environ.get("USAGE_DEBUG") == "1":
                     logger.warning("Windows tray refresh failed", exc_info=True)
 
@@ -1517,6 +1593,7 @@ class _WindowsTrayController:
             error_key = "history_load_error_parse"
         try:
             entries.extend(grok_loader.load_entries(hours_back=0))
+            entries.extend(muse_loader.load_entries(hours_back=0))
         except OSError:
             error_key = "history_load_error_file"
         except (ValueError, KeyError, TypeError):
@@ -1561,6 +1638,10 @@ class _WindowsTrayController:
         grok_result = menubar_grok.load_refresh_result(self.language)
         grok = grok_result.projection or menubar_grok.fallback_projection(self.language)
         measure("grok_load", started_at)
+        muse_result = menubar_muse.load_refresh_result(
+            self.language, allow_probe=not _hide_muse_enabled()
+        )
+        muse = muse_result.projection or menubar_muse.fallback_projection(self.language)
         started_at = time.monotonic() if debug_timing else 0.0
         local_date = datetime.now().astimezone().date()
         if self._history_cache_date != local_date or menubar_state.history_cache_needs_reload(
@@ -1599,12 +1680,26 @@ class _WindowsTrayController:
             )
         agy_window_keeper.maybe_ping(agy_result, self.mock)
         codex_window_keeper.maybe_ping(self.mock)
+        from quota.keeper_outcome import notify_failures
+
+        def send_keeper_notification(title: str, body: str) -> None:
+            if self.icon is not None:
+                self.icon.notify(body, title)
+
+        notify_failures(
+            self.language, _quota_notifications_enabled(), self.mock, send_keeper_notification
+        )
         return menubar_state.build_popover_state(
             outcome=outcome,
             codex_rows=codex_rows,
             agy_rows=(agy.session, agy.weekly),
             agy_group_name=agy.group_name,
+            agy_group_switchable=agy.group_switchable,
+            agy_weekly_only=agy.weekly_only,
             grok_row=grok.weekly,
+            muse_rows=(muse.session, muse.weekly),
+            muse_stale=muse.stale,
+            hide_muse=muse_result.hide_muse or _hide_muse_enabled(),
             projects=projects[0],
             projects_yesterday=projects[1],
             projects_7d=projects[2],
@@ -1613,17 +1708,16 @@ class _WindowsTrayController:
             language=self.language,
             group=self.tracker.group(),
             burn_rate_trackers=self.burn_rate_trackers,
-            today_text=(
-                _t(self.language, "today_text", cost="45.20", tokens="50,193,442")
+            today_total=(
+                menubar_state.PeriodTotal(tokens=50_193_442, cost=45.20)
                 if self.mock
-                else _today_text(history.entries, self.language)
+                else _today_total(history.entries)
             ),
-            yesterday_text=(
-                _t(self.language, "yesterday_text", cost="41.10", tokens="48,200,000")
+            yesterday_total=(
+                menubar_state.PeriodTotal(tokens=48_200_000, cost=41.10)
                 if self.mock
-                else _yesterday_text(history.entries, self.language)
+                else _yesterday_total(history.entries)
             ),
-            statusline=_statusline_payload(self.language),
             show_install_button=outcome.state == PollState.TOKEN_ERROR,
             hide_claude=_hide_claude_enabled(),
             hide_codex=_hide_codex_enabled(),
@@ -1657,18 +1751,70 @@ class _WindowsTrayController:
     async def _fetch(self) -> Any:
         return await self.usage_client.fetch_once()
 
+    def _tray_percent(self) -> float | None:
+        row = (
+            self.latest_state.codex_session
+            if self.tray_provider == "codex"
+            else self.latest_state.claude_session
+        )
+        # Codex can expose only a weekly window. A blank session title means
+        # that window is absent, rather than temporarily missing its quota.
+        if self.tray_provider == "codex" and not row.title and row.percent is None:
+            row = self.latest_state.codex_weekly
+        return row.display_percent if row.available else None
+
     def _update_tray(self) -> None:
-        percent = self.latest_state.claude_session.percent
+        percent = self._tray_percent()
         self._update_taskbar_progress(percent)
+        self._sync_quota_label()
         if self.icon is None:
             return
-        tooltip = build_tooltip(self.latest_state)
+        tooltip = build_tooltip(self.latest_state, self.tray_provider)
         if percent == self._last_tray_percent and tooltip == self._last_tray_tooltip:
             return
-        self.icon.icon = draw_tray_icon(percent)
+        self.icon.icon = draw_app_icon() if self.quota_label_enabled else draw_tray_icon(percent)
         self.icon.title = tooltip
         self._last_tray_percent = percent
         self._last_tray_tooltip = tooltip
+
+    def _sync_quota_label(self) -> None:
+        if self._native_ready and (self.quota_label_enabled or self.quota_label is not None):
+            self._dispatch_window_mutation(self._update_quota_label_on_ui_thread)
+
+    def _update_quota_label_on_ui_thread(self) -> None:
+        if not self.quota_label_enabled:
+            if self.quota_label is not None:
+                self.quota_label.close()
+                self.quota_label = None
+            return
+        if self.quota_label is None:
+            self.quota_label = TaskbarQuotaLabel(self.show_panel, self.show_tray_menu)
+        percent = self._tray_percent()
+        text, _color = tray_icon_style(percent)
+        self.quota_label.update(
+            _t(
+                self.language,
+                "quota_label_format" if percent is not None else "quota_label_unknown",
+                provider=_t(self.language, f"{self.tray_provider}_name"),
+                value=text,
+            ),
+            percent,
+            build_tooltip(self.latest_state, self.tray_provider),
+        )
+
+    def show_tray_menu(self) -> None:
+        if not self.stopping.is_set():
+            request_tray_menu(self.icon)
+
+    def toggle_quota_label(self, _icon: Any = None, _item: Any = None) -> None:
+        preferences = _load_preferences()
+        self.quota_label_enabled = not self.quota_label_enabled
+        preferences["quota_label_enabled"] = self.quota_label_enabled
+        _save_preferences(preferences)
+        self._last_tray_tooltip = ""
+        self._update_tray()
+        if self.icon is not None:
+            self.icon.update_menu()
 
     def _update_taskbar_progress(self, used_percent: float | None) -> None:
         # ITaskbarList3 targets a window's taskbar button, not the pystray icon.
@@ -1718,7 +1864,7 @@ class _WindowsTrayController:
         self.visible = True
         self._place_window()
         self._dispatch_window_mutation(self._show_panel_on_ui_thread)
-        self._update_taskbar_progress(self.latest_state.claude_session.percent)
+        self._update_taskbar_progress(self._tray_percent())
         self.inject_state(force=True)
         self.refresh()
 
@@ -1783,8 +1929,17 @@ class _WindowsTrayController:
         self.latest_state.hide_codex = _hide_codex_enabled()
         self.latest_state.hide_agy = _hide_agy_enabled()
         self.latest_state.hide_grok = _hide_grok_enabled()
+        self.latest_state.hide_muse = _hide_muse_enabled()
         if self.visible:
             self.inject_state()
+
+    def set_tray_provider(self, provider: object) -> None:
+        if not save_tray_provider(provider):
+            return
+        self.tray_provider = load_tray_provider()
+        self._update_tray()
+        if self.icon is not None:
+            self.icon.update_menu()
 
     def toggle_quota_notifications(self, _icon: Any = None, _item: Any = None) -> None:
         preferences = _load_preferences()
@@ -1833,6 +1988,118 @@ class _WindowsTrayController:
             if os.environ.get("USAGE_DEBUG") == "1":
                 logger.warning("toggle terse mode failed", exc_info=True)
 
+    def toggle_claude_pane(self, _icon: Any = None, _item: Any = None) -> None:
+        threading.Thread(target=self._toggle_claude_pane_in_background, daemon=True).start()
+
+    def _toggle_claude_pane_in_background(self) -> None:
+        import contextlib
+        import io
+
+        from installer import claude_pane
+
+        output = io.StringIO()
+        ok = False
+        enabled = False
+        try:
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                enabled = not claude_pane.is_claude_pane_enabled()
+                action = (
+                    claude_pane.enable_claude_pane if enabled else claude_pane.disable_claude_pane
+                )
+                ok = action() == 0
+        except SystemExit as exc:
+            print(exc.code, file=output)
+        except Exception as exc:
+            print(f"{type(exc).__name__}: {exc}", file=output)
+
+        if ok:
+            if enabled and not claude_pane.is_fullscreen_layout():
+                try:
+                    claude_pane.enable_fullscreen_layout()
+                except (OSError, SystemExit) as exc:
+                    self._message_box(f"{_t(self.language, 'claude_pane_action_failed')}\n\n{exc}")
+                else:
+                    self._message_box(
+                        f"{_t(self.language, 'claude_pane_enabled_msg')}\n\n"
+                        f"{_t(self.language, 'claude_pane_fullscreen_enabled_note')}"
+                    )
+            else:
+                key = "claude_pane_enabled_msg" if enabled else "claude_pane_disabled_msg"
+                self._message_box(_t(self.language, key))
+        else:
+            self._message_box(
+                f"{_t(self.language, 'claude_pane_action_failed')}\n\n{output.getvalue().strip()}"
+            )
+
+    def toggle_claude_beginner(self, _icon: Any = None, _item: Any = None) -> None:
+        threading.Thread(target=self._toggle_claude_beginner_in_background, daemon=True).start()
+
+    def _toggle_claude_beginner_in_background(self) -> None:
+        import contextlib
+        import io
+
+        from installer import claude_pane
+
+        output = io.StringIO()
+        ok = False
+        enabled = False
+        try:
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                enabled = not claude_pane.is_claude_beginner_enabled()
+                action = (
+                    claude_pane.enable_claude_beginner
+                    if enabled
+                    else claude_pane.disable_claude_beginner
+                )
+                ok = action() == 0
+        except SystemExit as exc:
+            print(exc.code, file=output)
+        except Exception as exc:
+            print(f"{type(exc).__name__}: {exc}", file=output)
+
+        if ok:
+            key = "claude_beginner_enabled_msg" if enabled else "claude_beginner_disabled_msg"
+            self._message_box(_t(self.language, key))
+        else:
+            self._message_box(
+                f"{_t(self.language, 'claude_beginner_action_failed')}\n\n"
+                f"{output.getvalue().strip()}"
+            )
+
+    def toggle_quota_aware(self, _icon: Any = None, _item: Any = None) -> None:
+        threading.Thread(target=self._toggle_quota_aware_in_background, daemon=True).start()
+
+    def _toggle_quota_aware_in_background(self) -> None:
+        import contextlib
+        import io
+
+        from installer import session_hooks
+
+        output = io.StringIO()
+        ok = False
+        enabled = False
+        try:
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                enabled = not session_hooks.is_quota_aware_enabled()
+                action = (
+                    session_hooks.enable_quota_aware
+                    if enabled
+                    else session_hooks.disable_quota_aware
+                )
+                ok = action() == 0
+        except SystemExit as exc:
+            print(exc.code, file=output)
+        except Exception as exc:
+            print(f"{type(exc).__name__}: {exc}", file=output)
+
+        if ok:
+            key = "quota_aware_enabled_msg" if enabled else "quota_aware_disabled_msg"
+            self._message_box(_t(self.language, key))
+        else:
+            self._message_box(
+                f"{_t(self.language, 'quota_aware_action_failed')}\n\n{output.getvalue().strip()}"
+            )
+
     def _process_quota_notifications(self, state: menubar_state.PopoverState) -> None:
         try:
             events = self._quota_notifier.update(
@@ -1855,6 +2122,14 @@ class _WindowsTrayController:
                         state.agy_weekly.percent,
                         state.agy_weekly.available and state.agy_stale is None,
                     ),
+                    "muse_session": (
+                        state.muse_session.display_percent,
+                        state.muse_session.available and state.muse_stale is None,
+                    ),
+                    "muse_weekly": (
+                        state.muse_weekly.display_percent,
+                        state.muse_weekly.available and state.muse_stale is None,
+                    ),
                 }
             )
             if _quota_notifications_enabled() and not self.mock:
@@ -1874,6 +2149,8 @@ class _WindowsTrayController:
             "codex_weekly": state.codex_weekly,
             "agy_session": state.agy_session,
             "agy_weekly": state.agy_weekly,
+            "muse_session": state.muse_session,
+            "muse_weekly": state.muse_weekly,
         }
         row = rows[event.channel]
         scope = row.title or _t(
@@ -1884,6 +2161,8 @@ class _WindowsTrayController:
             if event.channel.startswith("claude_")
             else "Antigravity"
             if event.channel.startswith("agy_")
+            else _t(self.language, "muse_name")
+            if event.channel.startswith("muse_")
             else "Codex"
         )
         message = _t(
@@ -1979,14 +2258,12 @@ class _WindowsTrayController:
         manual: bool,
         ignore_cooldown: bool,
         ignore_skipped: bool,
-    ) -> None:
+    ) -> bool:
         preferences = _load_preferences()
-        if not manual and not _auto_update_check_enabled(preferences):
-            return
         if not manual and not update_gate.auto_check_is_due(preferences):
-            return
+            return False
         if not ignore_cooldown and update_gate.dismissed_recently(preferences):
-            return
+            return False
 
         try:
             current_version = _current_version()
@@ -1995,13 +2272,13 @@ class _WindowsTrayController:
             if os.environ.get("USAGE_DEBUG") == "1":
                 logger.warning("Windows update check failed", exc_info=True)
             if manual:
-                self._message_box(_t(self.language, "update_check_failed"))
-            return
+                self._show_update_check_failed(None)
+            return True
 
         if result.failed:
             if manual:
-                self._message_box(_t(self.language, "update_check_failed"))
-            return
+                self._show_update_check_failed(result.failure_reason)
+            return True
 
         release = result.release
         # Re-read: the network check can take seconds, and a toggle saved meanwhile must survive.
@@ -2014,14 +2291,36 @@ class _WindowsTrayController:
         if release is None:
             if manual:
                 self._message_box(_t(self.language, "update_no_new_version"))
-            return
+            return False
         if not ignore_skipped and preferences.get("update_skipped_version") == release.version:
-            return
+            return False
         self._show_update_alert(release)
+
+        return False
+
+    def _run_auto_update_check(self) -> None:
+        failed = True
+        try:
+            failed = bool(
+                self._check_update_in_background(
+                    manual=False,
+                    ignore_cooldown=False,
+                    ignore_skipped=False,
+                )
+            )
+        finally:
+            self._auto_check_schedule.finish(time.time(), failed=failed)
+
+    def _show_update_check_failed(self, reason: str | None) -> None:
+        text = _t(self.language, "update_check_failed")
+        if reason is not None:
+            text += "\n" + _t(self.language, "update_check_failed_" + reason)
+        if self._message_box(text, style=0x5 | 0x30) == 4:
+            self.check_update()
 
     def _show_update_alert(self, release: update_checker.ReleaseInfo) -> None:
         title = _t(self.language, "update_alert_title", version=release.version)
-        body = format_release_notes(release.body, UPDATE_ALERT_BODY_LIMIT)
+        body = alert_release_notes(release.body, self.language, UPDATE_ALERT_BODY_LIMIT)
         result = self._message_box(f"{title}\n\n{body}", style=0x44)
         action, preference_updates = update_gate.resolve_alert_choice(
             1000 if result == 6 else 1001,
@@ -2063,16 +2362,8 @@ class _WindowsTrayController:
                 self._apply_content_height(payload.get("height"))
                 return None
             if action == "set_card_order":
-                order = payload.get("order")
-                if (
-                    isinstance(order, list)
-                    and all(isinstance(item, str) for item in order)
-                    and len(order) == 3
-                    and set(order) == {"agy", "claude", "codex"}
-                ):
-                    preferences = _load_preferences()
-                    preferences["quota_card_order"] = order
-                    _save_preferences(preferences)
+                # Shared with macOS: drops invalid orders and appends missing cards.
+                _save_quota_card_order(payload.get("order"))
             elif action == "set_panel_flavor":
                 _save_panel_flavor(payload.get("flavor"))
             elif action == "set_agy_quota_group":
@@ -2084,12 +2375,18 @@ class _WindowsTrayController:
                         self.latest_state.agy_session = projection.session
                         self.latest_state.agy_weekly = projection.weekly
                         self.latest_state.agy_group_name = projection.group_name
+                        self.latest_state.agy_group_switchable = projection.group_switchable
+                        self.latest_state.agy_weekly_only = projection.weekly_only
                         self.latest_state.agy_stale = projection.stale
                     self.inject_state(force=True)
             elif action == "switch_panel":
                 panel_id = payload.get("panel_id")
                 if isinstance(panel_id, str):
                     self._schedule_panel_switch(panel_id)
+            elif action == "set_tray_provider":
+                self.set_tray_provider(payload.get("provider"))
+            elif action == "toggle_quota_label":
+                self.toggle_quota_label()
             elif action == "toggle_hide_section":
                 preference_key = payload.get("preference_key")
                 if preference_key in {
@@ -2097,6 +2394,7 @@ class _WindowsTrayController:
                     "hide_codex_section",
                     "hide_agy_section",
                     "hide_grok_section",
+                    "hide_muse_section",
                 }:
                     self.toggle_hide_section(preference_key)
             elif action == "open_ai_daily":
@@ -2104,7 +2402,7 @@ class _WindowsTrayController:
             elif action == "reset_panel_position":
                 self.reset_panel_position()
             elif action == "refresh":
-                self.refresh()
+                self.refresh_manual()
             elif action == "toggle_login":
                 self.toggle_login()
             elif action == "toggle_quota_notifications":
@@ -2115,6 +2413,14 @@ class _WindowsTrayController:
                 self.toggle_session_resume()
             elif action == "toggle_terse_mode":
                 self.toggle_terse_mode()
+            elif action == "toggle_claude_pane":
+                self.toggle_claude_pane()
+            elif action == "toggle_claude_beginner":
+                self.toggle_claude_beginner()
+            elif action == "toggle_quota_aware":
+                self.toggle_quota_aware()
+            elif action == "toggle_statusline":
+                threading.Thread(target=self._toggle_statusline, daemon=True).start()
             elif action == "check_update":
                 self.check_update()
             elif action == "quit":
@@ -2122,7 +2428,7 @@ class _WindowsTrayController:
             return None
         action = str(payload)
         if action == "refresh":
-            self.refresh()
+            self.refresh_manual()
         elif action == "quit":
             self.quit()
         elif action == "switch":
@@ -2166,6 +2472,9 @@ class _WindowsTrayController:
 
     def quit(self, _icon: Any = None, _item: Any = None) -> None:
         self.stopping.set()
+        if self.quota_label is not None:
+            self.quota_label.close()
+            self.quota_label = None
         with self._file_event_lock:
             timer = self._file_event_refresh_timer
             self._file_event_refresh_timer = None
@@ -2207,15 +2516,22 @@ def _menu_model() -> tuple[wintray_menu.MenuEntry, ...]:
 def _menu_checked(controller: _WindowsTrayController, entry: wintray_menu.MenuCommand) -> bool:
     checks = {
         "active_panel": lambda: controller.active_panel_id == entry.argument_value,
+        "tray_provider": lambda: controller.tray_provider == entry.argument_value,
+        "quota_label": lambda: controller.quota_label_enabled,
         "hide_claude": _hide_claude_enabled,
         "hide_codex": _hide_codex_enabled,
         "hide_agy": _hide_agy_enabled,
         "hide_grok": _hide_grok_enabled,
+        "hide_muse": _hide_muse_enabled,
         "launch_at_login": win_login_item.is_enabled,
         "quota_notifications": _quota_notifications_enabled,
         "window_keeper": _window_keeper_enabled,
         "session_resume": _session_resume_enabled,
         "terse_mode": _terse_mode_enabled,
+        "claude_pane": _claude_pane_enabled,
+        "claude_beginner": _claude_beginner_enabled,
+        "quota_aware": _quota_aware_enabled,
+        "statusline": _statusline_enabled,
     }
     return checks[entry.checked_by]() if entry.checked_by is not None else False
 
@@ -2229,11 +2545,27 @@ def _panel_menu_entry(
         "i18nKey": entry.i18n_key,
         "label": _t(controller.language, entry.i18n_key),
     }
+    if entry.i18n_key == "window_keeper_menu" and _window_keeper_enabled():
+        from quota.keeper_outcome import failure_tooltip
+
+        failures = failure_tooltip(controller.language)
+        if failures:
+            data["label"] = _t(controller.language, entry.i18n_key) + " ⚠"
+            data["tooltip"] = failures + "\n" + _t(controller.language, "window_keeper_tooltip")
+    if entry.i18n_key == "terse_mode_menu" and _terse_mode_enabled():
+        from installer.codex_hook_trust import codex_terse_hook_trust
+
+        trust = codex_terse_hook_trust()
+        if trust in ("untrusted", "disabled"):
+            data["label"] = _t(controller.language, entry.i18n_key) + " ⚠"
+            data["tooltip"] = _t(controller.language, f"terse_codex_hook_{trust}")
     if isinstance(entry, wintray_menu.MenuGroup):
         data["action"] = ""
         data["children"] = [_panel_menu_entry(controller, child) for child in entry.children]
         return data
     data["action"] = entry.action
+    if entry.radio:
+        data["radio"] = True
     if entry.checked_by is not None:
         data["checked"] = _menu_checked(controller, entry)
     if entry.argument_name is not None:
@@ -2250,7 +2582,10 @@ def _tray_menu_entry(
         return pystray.Menu.SEPARATOR
     if isinstance(entry, wintray_menu.MenuGroup):
         children = tuple(_tray_menu_entry(pystray, controller, child) for child in entry.children)
-        return pystray.MenuItem(_t(controller.language, entry.i18n_key), pystray.Menu(*children))
+        return pystray.MenuItem(
+            _without_power_glyph(_t(controller.language, entry.i18n_key)),
+            pystray.Menu(*children),
+        )
     action = getattr(controller, entry.action)
     kwargs: dict[str, object] = {"radio": entry.radio}
     if entry.checked_by is not None:
@@ -2261,7 +2596,9 @@ def _tray_menu_entry(
         def action(_icon: Any, _item: Any, *, value: str = value) -> Any:
             return getattr(controller, entry.action)(value)
 
-    return pystray.MenuItem(_t(controller.language, entry.i18n_key), action, **kwargs)
+    return pystray.MenuItem(
+        _without_power_glyph(_t(controller.language, entry.i18n_key)), action, **kwargs
+    )
 
 
 def _session_resume_enabled() -> bool:
@@ -2282,6 +2619,33 @@ def _terse_mode_enabled() -> bool:
         return False
 
 
+def _claude_pane_enabled() -> bool:
+    try:
+        from installer import claude_pane
+
+        return claude_pane.is_claude_pane_enabled()
+    except Exception:
+        return False
+
+
+def _claude_beginner_enabled() -> bool:
+    try:
+        from installer import claude_pane
+
+        return claude_pane.is_claude_beginner_enabled()
+    except Exception:
+        return False
+
+
+def _quota_aware_enabled() -> bool:
+    try:
+        from installer import session_hooks
+
+        return session_hooks.is_quota_aware_enabled()
+    except Exception:
+        return False
+
+
 _SINGLE_INSTANCE_MUTEX = "usage-windows-tray-single-instance"
 _ERROR_ALREADY_EXISTS = 183
 _single_instance_handle: int | None = None
@@ -2294,15 +2658,12 @@ def _acquire_single_instance_lock() -> bool:
     loser's panel fails to initialize and lingers as a bare white window.
     """
     global _single_instance_handle
-    import ctypes
-
-    library_name = "windll"
-    windll: Any = getattr(ctypes, library_name)
-    handle = windll.kernel32.CreateMutexW(None, False, _SINGLE_INSTANCE_MUTEX)
+    handle = _kernel32.CreateMutexW(None, False, _SINGLE_INSTANCE_MUTEX)
     if not handle:
         return True
-    if windll.kernel32.GetLastError() == _ERROR_ALREADY_EXISTS:
-        windll.kernel32.CloseHandle(handle)
+    get_last_error: Any = getattr(ctypes, "get_last_error")  # noqa: B009
+    if get_last_error() == _ERROR_ALREADY_EXISTS:
+        _kernel32.CloseHandle(handle)
         return False
     _single_instance_handle = handle
     return True
@@ -2312,11 +2673,7 @@ def _release_single_instance_lock() -> None:
     global _single_instance_handle
     if _single_instance_handle is None:
         return
-    import ctypes
-
-    library_name = "windll"
-    windll: Any = getattr(ctypes, library_name)
-    windll.kernel32.CloseHandle(_single_instance_handle)
+    _kernel32.CloseHandle(_single_instance_handle)
     _single_instance_handle = None
 
 
@@ -2328,12 +2685,16 @@ def _show_already_running_notice() -> None:
     windll.user32.MessageBoxW(0, _t(detect_lang(), "wintray_already_running"), "usage", 0x40)
 
 
-def run_app(mock: bool = False, interval: int = 60) -> None:
+def run_app(
+    mock: bool = False,
+    interval: int = 60,
+    preferences_snapshot: dict[str, Any] | None = None,
+) -> None:
+    snapshot = _load_preferences() if preferences_snapshot is None else preferences_snapshot
     if not _acquire_single_instance_lock():
         _show_already_running_notice()
         return
 
-    import pystray
     import webview
 
     controller = _WindowsTrayController(mock, interval)
@@ -2352,11 +2713,20 @@ def run_app(mock: bool = False, interval: int = 60) -> None:
     if window is None:
         raise RuntimeError("pywebview did not create a window")
     window.events.loaded += controller.on_loaded
-    icon = pystray.Icon("usage", draw_tray_icon(None), "usage", _menu(controller))
+    icon_image = draw_app_icon() if controller.quota_label_enabled else draw_tray_icon(None)
+    icon = _tray_icon_class()("usage", icon_image, "usage", _menu(controller))
+    install_tray_menu(icon)
     controller.attach(icon, window)
     icon.run_detached()
+    from wintray.whats_new import start
+
+    start(_current_version(), snapshot, controller.language)
     try:
-        webview.start(gui="edgechromium", debug=os.environ.get("USAGE_DEBUG") == "1")
+        webview.start(
+            gui="edgechromium",
+            debug=os.environ.get("USAGE_DEBUG") == "1",
+            storage_path=str(_WEBVIEW_STORAGE_DIR),
+        )
     finally:
         controller.stopping.set()
         _release_single_instance_lock()

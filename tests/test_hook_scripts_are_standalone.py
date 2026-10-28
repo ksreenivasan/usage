@@ -10,7 +10,6 @@ import pytest
 
 PROJECT_IMPORT_ROOTS = {
     "analyzer",
-    "i18n",
     "installer",
     "loaders",
     "menubar",
@@ -25,13 +24,14 @@ HOOK_SCRIPTS = (
     "usage_statusline.py",
     "usage_terse_mode.py",
     "usage_terse_reminder.py",
+    "usage_quota_aware.py",
 )
 
 
 @pytest.mark.parametrize("script_name", HOOK_SCRIPTS)
 def test_copied_hook_scripts_have_no_project_imports(script_name: str) -> None:
     project_root = Path(__file__).resolve().parents[1]
-    tree = ast.parse((project_root / script_name).read_text(encoding="utf-8"))
+    tree = ast.parse((project_root / "usage_hooks" / script_name).read_text(encoding="utf-8"))
     imported_roots: set[str] = set()
     for node in tree.body:
         if isinstance(node, ast.Import):

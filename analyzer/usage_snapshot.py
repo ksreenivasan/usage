@@ -23,16 +23,18 @@ import logging
 import os
 from pathlib import Path
 import tempfile
+import threading
 from typing import NotRequired, TypeGuard, TypedDict
 
 from adapters.types import UsageEntry
 from loaders import cache_quarantine
-from pricing import calculate_cost
+from usage_common.pricing import calculate_cost
 
 logger = logging.getLogger(__name__)
 
 SNAPSHOT_PATH = Path(os.path.expanduser("~/.usage/usage_snapshot.json"))
 SNAPSHOT_SCHEMA = 1
+_snapshot_lock = threading.Lock()
 
 _RowKey = tuple[str, str, str, str, str]
 
@@ -79,9 +81,10 @@ def record_entries(
 ) -> UsageSnapshot:
     """Merge this load into the on-disk snapshot and return the result."""
     new_rows, new_headers = _aggregate_entries(entries, entry_dates)
-    merged = _merge_snapshot(_read_snapshot(), new_rows, new_headers)
-    _write_snapshot(merged)
-    return merged
+    with _snapshot_lock:
+        merged = _merge_snapshot(_read_snapshot(), new_rows, new_headers)
+        _write_snapshot(merged)
+        return merged
 
 
 def read_snapshot() -> UsageSnapshot:

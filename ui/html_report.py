@@ -28,7 +28,7 @@ from analyzer.reporter import (
     ReportData,
 )
 
-from i18n import _t as _i18n_t, packaged_resource_path
+from usage_common.i18n import _t as _i18n_t, packaged_resource_path
 from usage_common.usage_lang import detect_lang
 from usage_common.subprocess_utils import hidden_console_kwargs
 from ui.report_charts import render_share_bar, render_trend_bar
@@ -94,19 +94,6 @@ def _display_name(value: object, lang: str) -> str:
     return _t(lang, "unknown") if text == "unknown" else text
 
 
-def _localized_text(value: object, lang: str) -> str:
-    if not isinstance(value, dict):
-        return ""
-    for key in (lang, "en"):
-        localized = value.get(key)
-        if isinstance(localized, str) and localized:
-            return localized
-    for localized in value.values():
-        if isinstance(localized, str) and localized:
-            return localized
-    return ""
-
-
 def _section(
     title: str,
     body: str,
@@ -155,6 +142,7 @@ def _rank_line(
     arrow: str = "→",
     data_attributes: Mapping[str, object] | None = None,
     hidden: bool = False,
+    show_share: bool = False,
 ) -> str:
     classes = "rank-line" if not row_class else f"rank-line {row_class}"
     attributes = "".join(
@@ -171,7 +159,12 @@ def _rank_line(
         f'<span class="left-tick" aria-hidden="true"{color_attr}></span>'
         f'<span class="arrow">{arrow}</span>'
         f'<span class="name">{html.escape(name)}</span>'
-        f'<span class="tokens" data-label="{_escape(_t(lang, "tokens"))}">{_fmt_tokens(tokens)}</span>'
+        + (
+            f'<span class="pct" data-label="{_escape(_t(lang, "share"))}">{pct:.1f}%</span>'
+            if show_share
+            else ""
+        )
+        + f'<span class="tokens" data-label="{_escape(_t(lang, "tokens"))}">{_fmt_tokens(tokens)}</span>'
         f'<span class="cost" data-label="{_escape(_t(lang, "cost"))}">{_fmt_cost(cost)}</span>'
         f'<div class="gauge-rail" aria-hidden="true" style="{rail_style}"></div>'
         "</div>"
@@ -225,19 +218,20 @@ def _trend_summary(weekly: list[dict[str, int | float]], lang: str, date_to: dat
     if len(completed) < 2:
         return f"→ {_t(lang, 'trend_compare_first')}"
 
+    week = int(completed[-1]["week"])
     current = int(completed[-1]["tokens"])
     previous = int(completed[-2]["tokens"])
     if previous == 0:
         if current == 0:
-            return f"→ {_t(lang, 'trend_compare_flat')}"
-        return f"→ {_t(lang, 'trend_compare_new')}"
+            return f"→ {_t(lang, 'trend_compare_flat', week=week)}"
+        return f"→ {_t(lang, 'trend_compare_new', week=week)}"
 
     pct = round((current - previous) / previous * 100)
     if abs(pct) <= 5:
-        return f"→ {_t(lang, 'trend_compare_flat')}"
+        return f"→ {_t(lang, 'trend_compare_flat', week=week)}"
     if pct > 0:
-        return f"→ {_t(lang, 'trend_compare_up', ratio=f'{current / previous:.1f}')}"
-    return f"→ {_t(lang, 'trend_compare_down', pct=abs(pct))}"
+        return f"→ {_t(lang, 'trend_compare_up', week=week, ratio=f'{current / previous:.1f}')}"
+    return f"→ {_t(lang, 'trend_compare_down', week=week, pct=abs(pct))}"
 
 
 _PALETTE = [
@@ -292,7 +286,7 @@ def _trend_delta(current: int, previous: int, lang: str) -> tuple[str, str]:
     if abs(pct) <= 5:
         return "flat", "→ 0%"
     if pct > 0:
-        return "up", f"↗ +{pct}%"
+        return "surge" if current >= previous * 2 else "up", f"↗ +{pct}%"
     return "down", f"↘ {pct}%"
 
 
@@ -300,6 +294,7 @@ def _trend_ascii(daily: list[DailyTrendPoint], lang: str, date_to: date) -> str:
     weekly = _weekly_trend(daily)
     max_tokens = max((int(week["tokens"]) for week in weekly), default=0)
     data_start = min((_parse_daily_date(day["date"]) for day in daily), default=None)
+    first_partial = data_start is not None and data_start.weekday() != 0
     rows = []
     for idx, week in enumerate(weekly):
         tokens = int(week["tokens"])
@@ -316,12 +311,17 @@ def _trend_ascii(daily: list[DailyTrendPoint], lang: str, date_to: date) -> str:
             delta_html = (
                 f'<span class="delta flat">{_escape(_t(lang, "trend_week_in_progress"))}</span>'
             )
-        elif idx > 0:
+        elif idx > 0 and not (idx == 1 and first_partial):
             delta_class, delta_label = _trend_delta(tokens, int(weekly[idx - 1]["tokens"]), lang)
             delta_html = f'<span class="delta {delta_class}">{_escape(delta_label)}</span>'
+        partial_label = ""
+        if idx == 0 and (week_end - week_start).days < 6:
+            partial_label = " · " + _t(
+                lang, "trend_partial_week", days=(week_end - week_start).days + 1
+            )
         rows.append(
             f'<div class="trend-row" title="{tooltip}">'
-            f'<span class="week">W{int(week["week"])}</span>'
+            f'<span class="week">W{int(week["week"])} ({week_start:%m/%d}–{week_end:%m/%d}){_escape(partial_label)}</span>'
             f"{render_trend_bar(tokens, max_tokens)}"
             f"<em>{_fmt_tokens(tokens)}</em>"
             f"{delta_html}"
@@ -331,7 +331,10 @@ def _trend_ascii(daily: list[DailyTrendPoint], lang: str, date_to: date) -> str:
         return _empty_line(_t(lang, "empty_daily"))
 
     trend_rows = "".join(rows)
-    summary = f'<div class="trend-summary">{_escape(_trend_summary(weekly, lang, date_to))}</div>'
+    comparable = weekly[1:] if first_partial else weekly
+    summary = (
+        f'<div class="trend-summary">{_escape(_trend_summary(comparable, lang, date_to))}</div>'
+    )
     return f'<div class="trend">{trend_rows}{summary}</div>'
 
 
@@ -353,17 +356,11 @@ def _hour_histogram_html(histogram: list[int], lang: str) -> str:
             "</div>"
         )
     peak = (
-        f'<div class="persona-peak">{_escape(_t(lang, "persona_peak", count=max_count))}</div>'
+        f'<div class="persona-peak">{_escape(_t(lang, "persona_peak", count=max_count, hour=f"{values.index(max_count):02d}:00–{values.index(max_count) + 1:02d}:00"))}</div>'
         if max_count
         else ""
     )
     return f'<div class="persona-hours">{"".join(bars)}</div>{peak}'
-
-
-def _nonnegative_int(value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        return 0
-    return max(0, int(value))
 
 
 def _persona_body(persona: Mapping[str, object] | None, lang: str) -> str:
@@ -607,7 +604,7 @@ def _summary_cards(data: ReportData, lang: str) -> list[tuple[str, str, str]]:
             (
                 _t(lang, "kpi_active"),
                 _t(lang, "kpi_active_value", active=int(summary["active_days"]), total=total_days),
-                "",
+                _t(lang, "kpi_active_hint"),
             )
         )
         peak = _peak_day(data.get("daily_trend", []))
@@ -626,7 +623,7 @@ def _summary_cards(data: ReportData, lang: str) -> list[tuple[str, str, str]]:
             (
                 _t(lang, "kpi_active"),
                 _t(lang, "kpi_active_value", active=int(summary["active_days"]), total=total_days),
-                "",
+                _t(lang, "kpi_active_hint"),
             )
         )
         peak = _peak_day(data.get("daily_trend", []))
@@ -662,13 +659,23 @@ def _date_filter(data: Mapping[str, Any], lang: str) -> str:
             ("all", "range_all"),
         )
     )
+    earlier = any(
+        str(cell.get("date", "")) < str(dates[0]) and int(cell.get("tokens", 0)) > 0
+        for week in data.get("contribution", {}).get("weeks", [])
+        for cell in week
+    )
+    history_note = (
+        f'<p class="composition-hint" data-history-note hidden>{_escape(_t(lang, "history_scope", date=dates[0]))}</p>'
+        if earlier
+        else ""
+    )
     return (
         '<div class="date-filter" data-date-filter>'
         f'<div class="date-shortcuts">{buttons}</div>'
         '<div class="date-inputs">'
         f'<label>{_escape(_t(lang, "date_from"))}<input type="date" data-date-from min="{date_min}" max="{date_max}"></label>'
         f'<label>{_escape(_t(lang, "date_to"))}<input type="date" data-date-to min="{date_min}" max="{date_max}"></label>'
-        "</div></div>"
+        f"</div></div>{history_note}"
     )
 
 
@@ -715,29 +722,50 @@ def _render_share_dialog(lang: str) -> str:
 
 
 def _render_project_section(data: Mapping[str, Any], lang: str) -> str:
-    projects = data.get("by_project", [])
+    projects = list(data.get("by_project", []))
+    total = int(data.get("summary", {}).get("total_tokens", 0))
+    remainder = total - sum(int(project["tokens"]) for project in projects)
+    if remainder > 0:
+        cost = max(
+            0.0,
+            float(data.get("summary", {}).get("total_cost", 0))
+            - sum(float(project["cost"]) for project in projects),
+        )
+        projects.append(
+            {
+                "project": _t(lang, "project_others"),
+                "tokens": remainder,
+                "cost": cost,
+                "is_other": True,
+            }
+        )
     cube = data.get("cube")
     cube_projects = cube.get("projects", []) if isinstance(cube, Mapping) else []
     project_indices = {str(project): index for index, project in enumerate(cube_projects)}
     project_rows = [
         _rank_line(
             _display_name(project["project"], lang),
-            float(project["pct"]),
+            int(project["tokens"]) / total * 100 if total else 0.0,
             int(project["tokens"]),
             float(project["cost"]),
             lang,
             _PROJECT_COLOR,
+            show_share=True,
             data_attributes=(
-                {"project-index": project_indices[str(project["project"])]}
-                if str(project["project"]) in project_indices
-                else None
+                {"project-other": "true"}
+                if project.get("is_other")
+                else (
+                    {"project-index": project_indices[str(project["project"])]}
+                    if str(project["project"]) in project_indices
+                    else None
+                )
             ),
         )
-        for index, project in enumerate(projects)
+        for project in projects
     ]
     project_rows_html = "".join(project_rows)
     project_body = (
-        f'<div class="rank-head"><span></span><span>{_escape(_t(lang, "project"))}</span><span>{_escape(_t(lang, "tokens"))}</span><span>{_escape(_t(lang, "cost"))}</span></div>'
+        f'<div class="rank-head"><span></span><span>{_escape(_t(lang, "project"))}</span><span>{_escape(_t(lang, "share"))}</span><span>{_escape(_t(lang, "tokens"))}</span><span>{_escape(_t(lang, "cost"))}</span></div>'
         + f'<div class="rank-list">{project_rows_html}</div>'
         if project_rows
         else _empty_line(_t(lang, "empty_projects"))
@@ -772,7 +800,8 @@ def _render_composition_section(data: Mapping[str, Any], lang: str) -> str:
         ("cache_read", int(summary.get("cache_read_tokens", 0))),
     ]
     total = sum(tokens for _key, tokens in parts)
-    if total <= 0:
+    missing = max(0, int(summary.get("total_tokens", 0)) - total)
+    if total <= 0 and not missing:
         return ""
     colors = {key: _PALETTE[index] for index, (key, _tokens) in enumerate(parts)}
 
@@ -810,6 +839,7 @@ def _render_composition_section(data: Mapping[str, Any], lang: str) -> str:
 
     body = (
         f'<div class="rank-list">{rows}</div>'
+        f'<p class="composition-hint" data-composition-missing{(" hidden" if not missing else "")}>{_escape(_t(lang, "composition_missing", tokens=_fmt_tokens(missing)))}</p>'
         f'<div class="rank-head"><span></span>'
         f"<span>{_escape(_t(lang, 'composition_hit_rate'))}</span></div>"
         f'<p class="composition-hint">{_escape(_t(lang, "composition_hint"))}</p>'
@@ -940,14 +970,13 @@ def _render_pricing_section(data: Mapping[str, Any], lang: str) -> str:
 
 
 def _render_appendix(data: Mapping[str, Any], lang: str) -> str:
-    composition = _render_composition_section(data, lang)
     pricing = _render_pricing_section(data, lang)
-    if not composition and not pricing:
+    if not pricing:
         return ""
     return (
         '<details class="report-appendix">'
         f'<summary><span>[usage]&gt;</span> {_escape(_t(lang, "appendix_title"))}<span class="appendix-desc">{_escape(_t(lang, "appendix_desc"))}</span><i class="appendix-caret" aria-hidden="true">▸</i></summary>'
-        f"{composition}{pricing}"
+        f"{pricing}"
         "</details>"
     )
 
@@ -1037,7 +1066,7 @@ def _render_contribution_section(data: Mapping[str, Any], lang: str) -> str:
         "</div>"
     )
     return _section(
-        _t(lang, "contribution_section"),
+        _t(lang, "contribution_section", weeks=len(weeks)),
         body,
         "contribution-section",
         before_prompt=(
@@ -1077,9 +1106,19 @@ def _render_wrapped_section(data: Mapping[str, Any], lang: str) -> str:
     if beast not in {"phoenix", "dragon"}:
         return ""
 
-    weeks = wrapped.get("weeks", 53)
+    grid = data.get("contribution", {}).get("weeks", [])
+    weeks = len(grid) if grid else wrapped.get("weeks", 53)
     beast_name = _t(lang, f"wrapped_beast_{beast}_title")
-    beast_caption = _t(lang, f"wrapped_beast_{beast}_caption")
+    claude = int(wrapped.get("claude_tokens", 0))
+    codex = int(wrapped.get("codex_tokens", 0))
+    winner, other = (claude, codex) if beast == "phoenix" else (codex, claude)
+    suffix = "_dominant" if winner > 0 and winner >= 2 * other else ""
+    beast_caption = _t(lang, f"wrapped_beast_{beast}_caption{suffix}")
+    cost_note = (
+        _t(lang, "wrapped_cost_scope", date=wrapped["cost_recorded_from"])
+        if wrapped.get("cost_recorded_from")
+        else _t(lang, "wrapped_cost_no_records")
+    )
     books = _estimate_books(int(wrapped.get("total_tokens", 0)))
     top_project = _display_name(wrapped.get("top_project"), lang)
     top_model = _display_name(wrapped.get("top_model"), lang)
@@ -1092,12 +1131,13 @@ def _render_wrapped_section(data: Mapping[str, Any], lang: str) -> str:
         f'<div class="wrapped-total">{_escape(_fmt_int(int(wrapped.get("total_tokens", 0))))}</div>'
         f'<p class="wrapped-total-label">{_escape(_t(lang, "wrapped_total_tokens", weeks=weeks))}</p>'
         f'<p class="wrapped-analogy">{_escape(_t(lang, "wrapped_books_equivalent", books=_fmt_int(books)))}</p>'
+        f'<p class="composition-hint">{_escape(_t(lang, "wrapped_books_hint"))}</p>'
         "</div>"
         '<div class="wrapped-art">'
         f'<img src="{_escape(_sprite_data_uri(str(beast)))}" alt="{_escape(beast_name)}">'
         "</div>"
         '<div class="wrapped-metrics">'
-        f'<div class="wrapped-metric"><span>{_escape(_t(lang, "wrapped_total_cost", weeks=weeks))}</span><b>{_escape(_fmt_cost(float(wrapped.get("total_cost", 0.0))))}</b></div>'
+        f'<div class="wrapped-metric"><span>{_escape(_t(lang, "wrapped_total_cost", weeks=weeks))}</span><b>{_escape(_fmt_cost(float(wrapped.get("total_cost", 0.0))))}</b><small>{_escape(cost_note)}</small></div>'
         f'<div class="wrapped-metric"><span>{_escape(_t(lang, "wrapped_active_days"))}</span><b>{_escape(_fmt_int(int(wrapped.get("active_days", 0))))}</b></div>'
         f'<div class="wrapped-metric"><span>{_escape(_t(lang, "wrapped_longest_streak"))}</span><b>{_escape(_fmt_int(int(wrapped.get("longest_streak", 0))))} {_escape(_t(lang, "contribution_days_unit"))}</b></div>'
         f'<div class="wrapped-metric"><span>{_escape(_t(lang, "wrapped_top_model"))}</span><b>{_escape(top_model)}</b></div>'
@@ -1166,6 +1206,7 @@ def _share_config_json(lang: str, *, interactive: bool = False) -> str:
         "expand": _t(lang, "expand"),
         "pathCopied": _t(lang, "share_path_copied"),
         "projectShare": _t(lang, "project_share"),
+        "projectOthers": _t(lang, "project_others"),
     }
     if interactive:
         share_config.update(
@@ -1174,6 +1215,7 @@ def _share_config_json(lang: str, *, interactive: bool = False) -> str:
                 "cost": _t(lang, "cost"),
                 "costUnpriced": _t(lang, "kpi_cost_unpriced", tokens="{tokens}"),
                 "emptyProjects": _t(lang, "empty_projects"),
+                "kpiActiveHint": _t(lang, "kpi_active_hint"),
                 "kpiActiveValue": _t(lang, "kpi_active_value", active="{active}", total="{total}"),
                 "narrative": _t(
                     lang,
@@ -1193,6 +1235,8 @@ def _share_config_json(lang: str, *, interactive: bool = False) -> str:
                 "compositionCacheWrite": _t(lang, "composition_cache_write"),
                 "compositionHitRate": _t(lang, "composition_hit_rate"),
                 "compositionInput": _t(lang, "composition_input"),
+                "compositionMissing": _t(lang, "composition_missing", tokens="{tokens}"),
+                "trendPartialWeek": _t(lang, "trend_partial_week", days="{days}"),
                 "compositionOutput": _t(lang, "composition_output"),
                 "duration": _t(lang, "duration"),
                 "dailyChartTitle": _t(lang, "daily_chart_title"),
@@ -1210,11 +1254,11 @@ def _share_config_json(lang: str, *, interactive: bool = False) -> str:
                 "pricingUnpriced": _t(lang, "pricing_unpriced"),
                 "rank": _t(lang, "rank"),
                 "startTime": _t(lang, "start_time"),
-                "trendCompareDown": _t(lang, "trend_compare_down", pct="{pct}"),
+                "trendCompareDown": _t(lang, "trend_compare_down", week="{week}", pct="{pct}"),
                 "trendCompareFirst": _t(lang, "trend_compare_first"),
-                "trendCompareFlat": _t(lang, "trend_compare_flat"),
-                "trendCompareNew": _t(lang, "trend_compare_new"),
-                "trendCompareUp": _t(lang, "trend_compare_up", ratio="{ratio}"),
+                "trendCompareFlat": _t(lang, "trend_compare_flat", week="{week}"),
+                "trendCompareNew": _t(lang, "trend_compare_new", week="{week}"),
+                "trendCompareUp": _t(lang, "trend_compare_up", week="{week}", ratio="{ratio}"),
                 "trendMarkerNew": _t(lang, "trend_marker_new"),
                 "trendWeekInProgress": _t(lang, "trend_week_in_progress"),
             }
@@ -1321,13 +1365,14 @@ def generate_html(
             f"{insight_surface.rstrip()}\n"
             f"  {_render_trend_section(report_data, lang, date_to)}\n"
             f"  {_render_tools_section(report_data, lang)}\n"
+            f"  {_render_composition_section(report_data, lang).strip()}\n"
             f"  {_render_project_section(report_data, lang)}\n"
             f"  {_render_session_section(report_data, lang)}\n"
-            f"{('  ' + ledger_section + chr(10)) if ledger_section else ''}"
             f"  {_render_appendix(report_data, lang)}\n"
         )
         fixed_sections = (
             f"  {_render_contribution_section(report_data, lang)}\n"
+            f"{('  ' + ledger_section + chr(10)) if ledger_section else ''}"
             f"  {_render_persona_section(report_data, lang)}{_render_recent_titles_section(report_data, lang)}\n"
             f"  {_render_wrapped_section(report_data, lang)}\n"
         )

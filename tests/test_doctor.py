@@ -15,9 +15,9 @@ from pathlib import Path
 
 import pytest
 
-import doctor
 from installer import setup_hook
 from loaders import codex_loader, history_loader
+from usage_app import doctor
 
 
 @pytest.fixture(autouse=True)
@@ -262,8 +262,8 @@ def test_claude_cost_warns_for_large_difference(
         "load_entries",
         lambda: [_claude_entry("current", model="missing-model")],
     )
-    monkeypatch.setattr("pricing.calculate_cost", lambda entry: 5.0)
-    monkeypatch.setattr("pricing.is_model_priced", lambda model: False)
+    monkeypatch.setattr("usage_common.pricing.calculate_cost", lambda entry: 5.0)
+    monkeypatch.setattr("usage_common.pricing.is_model_priced", lambda model: False)
 
     check = doctor._claude_cost()
 
@@ -283,8 +283,8 @@ def test_claude_cost_is_ok_within_difference_threshold(
         encoding="utf-8",
     )
     monkeypatch.setattr(history_loader, "load_entries", lambda: [_claude_entry("current")])
-    monkeypatch.setattr("pricing.calculate_cost", lambda entry: 8.5)
-    monkeypatch.setattr("pricing.is_model_priced", lambda model: True)
+    monkeypatch.setattr("usage_common.pricing.calculate_cost", lambda entry: 8.5)
+    monkeypatch.setattr("usage_common.pricing.is_model_priced", lambda model: True)
 
     check = doctor._claude_cost()
 
@@ -333,7 +333,7 @@ def test_render_json_has_structured_checks() -> None:
 
     assert isinstance(payload["version"], str)
     assert set(payload) == {"version", "checks", "self_heal_log", "summary"}
-    assert payload["summary"] == {"ok": 5, "warn": 9, "error": 0}
+    assert payload["summary"] == {"ok": 5, "warn": 10, "error": 0}
     expected_codes = {
         "status_file",
         "codex_sessions",
@@ -349,6 +349,7 @@ def test_render_json_has_structured_checks() -> None:
         "codex_rate_limits",
         "codex_history",
         "claude_cost",
+        "codex_terse_hook_trust",
     }
     checks = payload["checks"]
     assert {check["code"] for check in checks} == expected_codes

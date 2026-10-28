@@ -8,11 +8,11 @@ from pathlib import Path
 
 import pytest
 
-import prefs
 from loaders.agy_quota_probe import AgyQuotaGroup, AgyQuotaResult, AgyQuotaWindow
 from menubar import agy as menubar_agy
 from menubar.prefs import _save_agy_quota_group
 from quota.burn_rate import BurnRateTracker
+from usage_common import prefs
 
 
 def _group(
@@ -81,6 +81,7 @@ def test_project_quota_selects_gemini_group_and_converts_percent() -> None:
 
     assert projection is not None
     assert projection.group_name == "GEMINI MODELS"
+    assert projection.group_switchable is True
     assert projection.session.title == "Session"
     assert projection.session.percent == 60.0
     assert projection.session.percent_text == "60% used"
@@ -111,6 +112,11 @@ def test_project_quota_selects_claude_and_falls_back_to_gemini() -> None:
     )
     assert fallback is not None
     assert fallback.group_name == "GEMINI MODELS"
+    assert fallback.group_switchable is False
+
+
+def test_fallback_projection_disables_group_switching() -> None:
+    assert menubar_agy.fallback_projection("en").group_switchable is False
 
 
 def test_switch_reprojects_cached_quota_and_resets_trackers(
@@ -221,6 +227,27 @@ def test_project_quota_marks_full_session_with_sliding_countdown_as_full() -> No
     assert projection.session.reset_text != "Resets in 4h 59m"
 
 
+def test_project_quota_shows_session_paused_when_weekly_is_spent() -> None:
+    quota = AgyQuotaResult(
+        groups=[
+            AgyQuotaGroup(
+                name="CLAUDE AND GPT MODELS",
+                models=["model"],
+                five_hour=AgyQuotaWindow(100.0, None, None),
+                weekly=AgyQuotaWindow(0.0, "57h", 3420),
+            )
+        ],
+        fetched_at="2026-01-01T00:00:00+00:00",
+    )
+
+    projection = menubar_agy.project_quota(quota, "en", now=1_767_225_600.0)
+
+    assert projection is not None
+    assert projection.session.percent_text == "Paused"
+    assert projection.session.reset_text == "Weekly quota used up; waits for weekly reset"
+    assert projection.weekly.percent == 100.0
+
+
 def test_project_quota_marks_cached_result_stale_after_twenty_minutes() -> None:
     now = datetime(2026, 1, 1, 1, 0, tzinfo=UTC)
     quota = AgyQuotaResult(
@@ -288,7 +315,7 @@ def test_project_quota_counts_down_by_cache_age() -> None:
     assert projection.session.reset_text == "Resets in 9m"
 
 
-def test_project_quota_countdown_clamps_to_one_minute_when_overdue() -> None:
+def test_project_quota_displays_zero_when_overdue() -> None:
     now_dt = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
     fetched = now_dt - timedelta(minutes=18)
     quota = AgyQuotaResult(
@@ -307,7 +334,10 @@ def test_project_quota_countdown_clamps_to_one_minute_when_overdue() -> None:
     projection = menubar_agy.project_quota(quota, "en", now=now_dt.timestamp())
 
     assert projection is not None
-    assert projection.session.reset_text == "Resets in 1m"
+    assert projection.session.reset_text == "Reset"
+    assert projection.session.display_percent == 0.0
+    assert projection.session.percent == 50.0
+    assert not projection.session.warning
 
 
 def test_project_quota_warns_when_session_will_empty_before_reset() -> None:
@@ -478,3 +508,134 @@ def test_project_quota_warns_for_weekly_window_after_thirty_minute_span() -> Non
 
     assert projection is not None
     assert projection.weekly.warning is True
+
+
+@pytest.mark.parametrize(
+    "age_minutes, text, used",
+    [(12.0, "Reset", 0.0), (11.5, "Reset imminent", 90.0), (11.0, "Resets in 1m", 90.0)],
+)
+def test_window_row_reset_boundary(age_minutes: float, text: str, used: float) -> None:
+    window = AgyQuotaWindow(10.0, None, 12)
+    row = menubar_agy._window_row("Session", window, "en", age_minutes, forecast_seconds=10.0)
+    assert row.display_percent == used
+    if age_minutes >= 11.5:
+        assert row.reset_text == text
+        assert not row.warning
+    assert window.remaining_percent == 10.0
+
+
+def test_fresh_cache_with_expired_login_is_stale() -> None:
+    from loaders import agy_quota_probe
+    from menubar import agy
+
+    agy_quota_probe.AUTH_EXPIRED_PATH.touch()
+    now = datetime.now(UTC)
+    state = agy._stale_state(now.isoformat(), now.timestamp(), "zh-TW")
+    assert state is not None
+    assert state["ageText"] == "登入過期"
+    assert "agy" in state["tooltip"]
+
+
+@pytest.mark.parametrize("weekly", [True, False])
+def test_unreported_window_is_unavailable_and_not_recorded(weekly: bool) -> None:
+    now = datetime.now(UTC)
+    window = AgyQuotaWindow(50, "1h 0m", 60)
+    group = AgyQuotaGroup(
+        "GEMINI MODELS", [], window if weekly else None, None if weekly else window
+    )
+    trackers = _burn_rate_trackers()
+    projection = menubar_agy.project_quota(
+        AgyQuotaResult([group], now.isoformat()),
+        "en",
+        now=now.timestamp(),
+        burn_rate_trackers=trackers,
+    )
+    assert projection is not None
+    row = projection.session if weekly else projection.weekly
+    assert row.available is False
+    assert row.percent is None
+    assert row.percent_text == "--"
+    assert row.reset_text == "Not reported by Google"
+    assert trackers["agy_session" if weekly else "agy_weekly"].last_timestamp is None
+    assert (projection.weekly if weekly else projection.session).percent_text == "50% used"
+
+
+@pytest.mark.parametrize("preference", ["gemini", "claude_gpt", "argon"])
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("GEMINI MODELS", "gemini"),
+        ("CLAUDE AND GPT MODELS", "claude_gpt"),
+        ("Gemini 4 Argon", "argon"),
+    ],
+)
+def test_matches_group_keeps_three_groups_separate(
+    preference: str, name: str, expected: str
+) -> None:
+    assert menubar_agy._matches_group(name, preference) is (preference == expected)
+
+
+@pytest.mark.parametrize("remaining", [0.0, 50.0, 100.0])
+@pytest.mark.parametrize(
+    ("language", "detail"),
+    [
+        ("zh-TW", "這組只有週額度"),
+        ("en", "Weekly limit only"),
+        ("zh-CN", "这组只有周额度"),
+        ("ja", "週間上限のみ"),
+        ("ko", "주간 한도만 있음"),
+    ],
+)
+def test_project_quota_argon_has_weekly_only(remaining: float, language: str, detail: str) -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    quota = AgyQuotaResult(
+        groups=[
+            _group("GEMINI MODELS", session_remaining=40, weekly_remaining=90),
+            AgyQuotaGroup(
+                "GEMINI 4 ARGON", ["Gemini 4 Argon"], AgyQuotaWindow(remaining, None, 1440), None
+            ),
+        ],
+        fetched_at=now.isoformat(),
+    )
+    projection = menubar_agy.project_quota(
+        quota, language, now=now.timestamp(), group_preference="argon"
+    )
+    assert projection is not None
+    assert projection.group_name == "GEMINI 4 ARGON"
+    assert projection.five_hour is None
+    assert projection.session.percent is None
+    assert projection.session.available is False
+    assert projection.session.percent_text == "--"
+    assert projection.session.reset_text == detail
+    assert projection.weekly.percent == 100.0 - remaining
+    assert projection.weekly_only is True
+
+
+def test_project_quota_missing_argon_falls_back_to_gemini() -> None:
+    quota = AgyQuotaResult(
+        groups=[
+            _group("CLAUDE AND GPT MODELS", session_remaining=70, weekly_remaining=0),
+            _group("GEMINI MODELS", session_remaining=40, weekly_remaining=90),
+        ],
+        fetched_at="2026-01-01T00:00:00+00:00",
+    )
+    projection = menubar_agy.project_quota(
+        quota, "en", now=1_767_225_600.0, group_preference="argon"
+    )
+    assert projection is not None
+    assert projection.group_name == "GEMINI MODELS"
+    assert projection.weekly_only is False
+    assert projection.session.percent_text == "60% used"
+
+
+def test_missing_gemini_fallback_prefers_claude_over_argon() -> None:
+    quota = AgyQuotaResult(
+        groups=[
+            _group("GEMINI 4 ARGON", session_remaining=0, weekly_remaining=0),
+            _group("CLAUDE AND GPT MODELS", session_remaining=70, weekly_remaining=70),
+        ],
+        fetched_at="2026-01-01T00:00:00+00:00",
+    )
+    projection = menubar_agy.project_quota(quota, "en", now=1_767_225_600.0)
+    assert projection is not None
+    assert projection.group_name == "CLAUDE AND GPT MODELS"

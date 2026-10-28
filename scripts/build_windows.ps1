@@ -33,14 +33,17 @@ try {
         --add-data "$(Join-Path $RepoRoot 'i18n.json');." `
         --add-data "$(Join-Path $RepoRoot 'pyproject.toml');." `
         --add-data "$(Join-Path $RepoRoot 'assets');assets" `
-        --add-data "$(Join-Path $RepoRoot 'usage_statusline.py');." `
-        --add-data "$(Join-Path $RepoRoot 'usage_statusline_agy.py');." `
-        --add-data "$(Join-Path $RepoRoot 'usage_statusline_grok.py');." `
-        --add-data "$(Join-Path $RepoRoot 'usage_statusline_forwarder.py');." `
-        --add-data "$(Join-Path $RepoRoot 'usage_session_resume.py');." `
-        --add-data "$(Join-Path $RepoRoot 'usage_terse_mode.py');." `
-        --add-data "$(Join-Path $RepoRoot 'usage_terse_reminder.py');." `
+        --add-data "$(Join-Path $RepoRoot 'claude_pane');claude_pane" `
+        --add-data "$(Join-Path $RepoRoot 'usage_hooks/usage_statusline.py');usage_hooks" `
+        --add-data "$(Join-Path $RepoRoot 'usage_hooks/usage_statusline_agy.py');usage_hooks" `
+        --add-data "$(Join-Path $RepoRoot 'usage_hooks/usage_statusline_grok.py');usage_hooks" `
+        --add-data "$(Join-Path $RepoRoot 'usage_hooks/usage_statusline_forwarder.py');usage_hooks" `
+        --add-data "$(Join-Path $RepoRoot 'usage_hooks/usage_session_resume.py');usage_hooks" `
+        --add-data "$(Join-Path $RepoRoot 'usage_hooks/usage_terse_mode.py');usage_hooks" `
+        --add-data "$(Join-Path $RepoRoot 'usage_hooks/usage_terse_reminder.py');usage_hooks" `
+        --add-data "$(Join-Path $RepoRoot 'usage_hooks/usage_quota_aware.py');usage_hooks" `
         --hidden-import wintray.app `
+        --hidden-import usage_app.cli `
         --hidden-import pystray `
         --hidden-import webview `
         --hidden-import webview.platforms.edgechromium `
@@ -64,6 +67,8 @@ $Executable = Join-Path $OutputDir "usage.exe"
 if (-not (Test-Path $Executable -PathType Leaf)) {
     throw "PyInstaller did not produce $Executable"
 }
+
+Copy-Item -LiteralPath (Join-Path $RepoRoot "THIRD_PARTY_NOTICES.md") -Destination $OutputDir
 
 # The exe existing is not proof it works: v0.29.34-36 shipped bundles whose
 # hidden-import names still pointed at pre-refactor top-level modules, so the

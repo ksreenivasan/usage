@@ -16,12 +16,13 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
-from i18n import _t  # noqa: E402
 from menubar import app as menubar  # noqa: E402
-from menubar.state import PopoverState, QuotaRowState, format_human_time  # noqa: E402
+from menubar.prefs import DEFAULT_PANEL_FLAVOR  # noqa: E402
+from menubar.state import PeriodTotal, PopoverState, QuotaRowState, format_human_time  # noqa: E402
 from panels import all_panels  # noqa: E402
 from panels.dynamic_height import inject_content_height_script  # noqa: E402
 from panels.payload import _load_panel_html, _state_payload  # noqa: E402
+from usage_common.i18n import _t  # noqa: E402
 
 # 面板用 window.webkit.messageHandlers 把量到的自然高度回報給原生端。
 # 瀏覽器裡沒有那座橋，補一個假的，把高度轉發給外層的展示頁。
@@ -70,9 +71,13 @@ def _demo_state(language: str) -> PopoverState:
     state.agy_session = _row(language, "session_label", 18.0, 12_600)
     state.agy_weekly = _row(language, "weekly_label", 12.0, 464_400)
     state.agy_group_name = "GEMINI MODELS"
+    state.agy_group_switchable = True
     state.hide_agy = False
     state.grok_weekly = _row(language, "weekly_label", 38.0, 544_800)
     state.hide_grok = False
+    state.muse_session = _row(language, "session_label", 24.0, 10_800)
+    state.muse_weekly = _row(language, "weekly_label", 42.0, 345_600)
+    state.hide_muse = False
     state.projects = list(DEMO_PROJECTS)
     state.projects_yesterday = list(DEMO_PROJECTS)
     state.projects_7d = list(DEMO_PROJECTS)
@@ -80,9 +85,8 @@ def _demo_state(language: str) -> PopoverState:
     state.projects_all = list(DEMO_PROJECTS)
     state.rate_text = _t(language, "rate_text", value=_t(language, "group_active"))
     state.status_text = _t(language, "status_text", value=_t(language, "status_synced"))
-    # 模板自己帶錢字號，cost 只給數字，否則會印成 $$28.51。
-    state.today_text = _t(language, "today_text", cost="28.51", tokens="11,150,000")
-    state.yesterday_text = _t(language, "yesterday_text", cost="19.84", tokens="7,420,000")
+    state.today_total = PeriodTotal(tokens=11_150_000, cost=28.51)
+    state.yesterday_total = PeriodTotal(tokens=7_420_000, cost=19.84)
     state.show_install_button = False
     return state
 
@@ -127,6 +131,8 @@ def main() -> int:
         # html_filename 與 width/height 是 HTMLPanel 的實作細節，別直接取。
         width, height = panel.preferred_size()
         html = _load_panel_html(f"{panel.id}.html")
+        # app 載入時會換成使用者選的配色；沒換的話 catppuccin 的變數全空，主按鈕變成暗字暗底。
+        html = html.replace("{{PANEL_FLAVOR}}", DEFAULT_PANEL_FLAVOR)
         # 順序有意義：先補假橋接，再讓 dynamic_height 包住 usageApplyState，
         # 最後才餵資料，這樣量高度的包裝已經就位。
         html = html.replace("</body>", f"{WEBKIT_SHIM}</body>", 1)

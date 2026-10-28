@@ -19,21 +19,24 @@ from typing import Any, Protocol
 import quota.agy_window_keeper as agy_window_keeper
 import quota.codex_window_keeper as codex_window_keeper
 import quota.window_keeper as window_keeper
+from loaders.claude_usage import PollOutcome, PollState
 from loaders.history_loader import UsageEntry
 from menubar import agy as menubar_agy
 from menubar import grok as menubar_grok
+from menubar import muse as menubar_muse
 from menubar import state as menubar_state
 from menubar.prefs import (
     _hide_agy_enabled,
     _hide_claude_enabled,
     _hide_codex_enabled,
     _hide_grok_enabled,
+    _hide_muse_enabled,
     _quota_card_order,
 )
+from quota import quota_snapshot
 from quota.burn_rate import BurnRateTracker
 from quota.usage_rate import UsageRateTracker
-from service_status import CLAUDE_STATUS, CODEX_STATUS, get_service_status
-from usage_client import PollOutcome, PollState
+from usage_common.service_status import CLAUDE_STATUS, CODEX_STATUS, get_service_status
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +78,8 @@ class RefreshSources:
     grok_result: menubar_grok.GrokRefreshResult
     grok_projection: menubar_grok.GrokQuotaProjection
     debug_timing: bool
+    muse_result: menubar_muse.MuseRefreshResult
+    muse_projection: menubar_muse.MuseQuotaProjection
 
     def measure(self, stage: str, started_at: float) -> None:
         if self.debug_timing:
@@ -102,6 +107,10 @@ def load_sources(app: _RefreshApp) -> RefreshSources:
         elapsed_ms = (time.monotonic() - started_at) * 1000
         logger.debug("refresh_timing stage=%s elapsed_ms=%.1f", "grok_load", elapsed_ms)
     grok_projection = grok_result.projection or menubar_grok.fallback_projection(app.language)
+    muse_result = menubar_muse.load_refresh_result(
+        app.language, allow_probe=not _hide_muse_enabled()
+    )
+    muse_projection = muse_result.projection or menubar_muse.fallback_projection(app.language)
     return RefreshSources(
         codex_result=codex_result,
         history_scan=(
@@ -110,6 +119,8 @@ def load_sources(app: _RefreshApp) -> RefreshSources:
         agy_result=agy_result,
         agy_projection=agy_projection,
         grok_result=grok_result,
+        muse_result=muse_result,
+        muse_projection=muse_projection,
         grok_projection=grok_projection,
         debug_timing=debug_timing,
     )
@@ -121,15 +132,16 @@ def build_result(app: _RefreshApp, sources: RefreshSources) -> dict[str, Any]:
     agy_projection = sources.agy_projection
     grok_result = sources.grok_result
     grok_projection = sources.grok_projection
+    muse_projection = sources.muse_projection
+    hide_muse = sources.muse_result.hide_muse or _hide_muse_enabled()
     fallback_state = getattr(app, "latest_state", menubar_state._empty_state(app.language))
     project_rows = list(fallback_state.projects)
     project_rows_yesterday = list(fallback_state.projects_yesterday)
     project_rows_7d = list(fallback_state.projects_7d)
     project_rows_30d = list(fallback_state.projects_30d)
     project_rows_all = list(fallback_state.projects_all)
-    today_text = fallback_state.today_text
-    yesterday_text = fallback_state.yesterday_text
-    statusline = fallback_state.statusline
+    today_total = fallback_state.today_total
+    yesterday_total = fallback_state.yesterday_total
     hide_claude = fallback_state.hide_claude
     hide_codex = fallback_state.hide_codex
     hide_agy = agy_result.hide_agy or _hide_agy_enabled()
@@ -158,9 +170,8 @@ def build_result(app: _RefreshApp, sources: RefreshSources) -> dict[str, Any]:
                 project_rows_all,
             ) = menubar_state.project_rows_for_windows(all_entries)
         sources.measure("project_rows_windows", started_at)
-        today_text = menubar_state._today_title(app.mock, app.language, entries=all_entries)
-        yesterday_text = menubar_state._yesterday_title(app.mock, app.language, entries=all_entries)
-        statusline = menubar_state._statusline_payload(app.language)
+        today_total = menubar_state._today_total(app.mock, entries=all_entries)
+        yesterday_total = menubar_state._yesterday_total(app.mock, entries=all_entries)
         hide_claude = _hide_claude_enabled()
         hide_codex = _hide_codex_enabled()
         hide_agy = agy_result.hide_agy or _hide_agy_enabled()
@@ -192,7 +203,12 @@ def build_result(app: _RefreshApp, sources: RefreshSources) -> dict[str, Any]:
             codex_rows=codex_rows,
             agy_rows=(agy_projection.session, agy_projection.weekly),
             agy_group_name=agy_projection.group_name,
+            agy_group_switchable=agy_projection.group_switchable,
+            agy_weekly_only=agy_projection.weekly_only,
             grok_row=grok_projection.weekly,
+            muse_rows=(muse_projection.session, muse_projection.weekly),
+            muse_stale=muse_projection.stale,
+            hide_muse=hide_muse,
             projects=project_rows,
             projects_yesterday=project_rows_yesterday,
             projects_7d=project_rows_7d,
@@ -201,9 +217,8 @@ def build_result(app: _RefreshApp, sources: RefreshSources) -> dict[str, Any]:
             language=app.language,
             group=group,
             burn_rate_trackers=app.burn_rate_trackers,
-            today_text=today_text,
-            yesterday_text=yesterday_text,
-            statusline=statusline,
+            today_total=today_total,
+            yesterday_total=yesterday_total,
             show_install_button=show_install_button,
             hide_claude=hide_claude,
             hide_codex=hide_codex,
@@ -228,6 +243,13 @@ def build_result(app: _RefreshApp, sources: RefreshSources) -> dict[str, Any]:
             )
         agy_window_keeper.maybe_ping(agy_result, app.mock)
         codex_window_keeper.maybe_ping(app.mock)
+        from menubar.notify import send_simple_notification
+        from menubar.prefs import _quota_notifications_enabled
+        from quota.keeper_outcome import notify_failures
+
+        notify_failures(
+            app.language, _quota_notifications_enabled(), app.mock, send_simple_notification
+        )
     except Exception as exc:
         if os.environ.get("USAGE_DEBUG") == "1":
             logger.warning("refresh failed", exc_info=True)
@@ -241,9 +263,15 @@ def build_result(app: _RefreshApp, sources: RefreshSources) -> dict[str, Any]:
         state.agy_session = agy_projection.session
         state.agy_weekly = agy_projection.weekly
         state.agy_group_name = agy_projection.group_name
+        state.agy_group_switchable = agy_projection.group_switchable
+        state.agy_weekly_only = agy_projection.weekly_only
         state.agy_stale = agy_projection.stale
         state.grok_weekly = grok_projection.weekly
         state.grok_stale = grok_projection.stale
+        state.muse_session = muse_projection.session
+        state.muse_weekly = muse_projection.weekly
+        state.muse_stale = muse_projection.stale
+        state.hide_muse = hide_muse
         state.history_error = menubar_state.history_load_error_state(
             app._history_load_error_key, app.language
         )
@@ -252,15 +280,16 @@ def build_result(app: _RefreshApp, sources: RefreshSources) -> dict[str, Any]:
         state.projects_7d = project_rows_7d
         state.projects_30d = project_rows_30d
         state.projects_all = project_rows_all
-        state.today_text = today_text
-        state.yesterday_text = yesterday_text
-        state.statusline = statusline
+        state.today_total = today_total
+        state.yesterday_total = yesterday_total
         state.hide_claude = hide_claude
         state.hide_codex = hide_codex
         state.hide_agy = hide_agy
         state.hide_grok = hide_grok
         state.card_order = card_order
 
+    if not app.mock:
+        quota_snapshot.write_snapshot()
     return {
         "state": state,
         "codex_5h_pct": codex_5h_pct,

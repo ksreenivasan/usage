@@ -42,6 +42,7 @@ class Panel(Protocol):
     codex_card_height: float
     agy_card_height: float
     grok_card_height: float
+    muse_card_height: float
     service_alert_height: float
 
     def build_view(self, delegate: Any) -> Any: ...
@@ -51,7 +52,7 @@ class Panel(Protocol):
 
 def load_active_panel_id(defaults: Any | None = None) -> str:
     if defaults is None and sys.platform == "win32":
-        from prefs import _load_preferences
+        from usage_common.prefs import _load_preferences
 
         value = _load_preferences().get(ACTIVE_PANEL_DEFAULTS_KEY)
         return str(value) if isinstance(value, str) and value else "classic"
@@ -63,7 +64,7 @@ def load_active_panel_id(defaults: Any | None = None) -> str:
 
 def save_active_panel_id(panel_id: str, defaults: Any | None = None) -> None:
     if defaults is None and sys.platform == "win32":
-        from prefs import _load_preferences, _save_preferences
+        from usage_common.prefs import _load_preferences, _save_preferences
 
         preferences = _load_preferences()
         preferences[ACTIVE_PANEL_DEFAULTS_KEY] = panel_id

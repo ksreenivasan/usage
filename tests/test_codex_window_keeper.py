@@ -635,6 +635,11 @@ def test_run_codex_ping_uses_verified_noninteractive_command(
         "-m",
         "gpt-5.6-luna",
         "--skip-git-repo-check",
+        "--ephemeral",
+        "-c",
+        "features.hooks=false",
+        "-c",
+        "notify=[]",
         "ok",
     ]
     assert captured["stdin"] is subprocess.DEVNULL

@@ -20,7 +20,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from i18n import t as _t
 from installer import setup_hook
 from installer.setup_hook import (
     BACKUP_KEY,
@@ -50,8 +49,9 @@ from installer.setup_hook import (
     update_hook,
 )
 from loaders.codex_paths import codex_home
+from usage_common.i18n import t as _t
 from usage_common.usage_lang import detect_lang
-from usage_statusline import _exclusive_lock
+from usage_hooks.usage_statusline import _exclusive_lock
 
 CODEX_CONFIG = setup_hook.CODEX_CONFIG
 
@@ -59,7 +59,7 @@ CODEX_CONFIG = setup_hook.CODEX_CONFIG
 # session. Off by default: enabled only via the menu toggle, never by self_heal.
 RESUME_HOOK_TARGET = Path(os.path.expanduser("~/.claude/usage-session-resume.py"))
 RESUME_PROMPT_SIDECAR = Path(os.path.expanduser("~/.claude/usage-resume-prompt.json"))
-RESUME_HOOK_VERSION = "1.10"
+RESUME_HOOK_VERSION = "1.11"
 RESUME_MATCHER = "startup|clear|resume"
 RESUME_LANGS = ("zh-TW", "zh-CN", "en", "ja", "ko")
 _RESUME_MARKER = "usage-session-resume"
@@ -73,7 +73,7 @@ _RESUME_DIAGNOSIS_CAUSE_KEYS = (
 )
 TERSE_HOOK_TARGET = Path(os.path.expanduser("~/.claude/usage-terse-mode.py"))
 TERSE_PROMPT_SIDECAR = Path(os.path.expanduser("~/.claude/usage-terse-prompt.json"))
-TERSE_HOOK_VERSION = "1.6"
+TERSE_HOOK_VERSION = "1.7"
 TERSE_MATCHER = "startup|clear"
 TERSE_LANGS = ("zh-TW", "zh-CN", "en", "ja", "ko")
 _TERSE_MARKER = "usage-terse-mode"
@@ -92,6 +92,12 @@ TERSE_REMINDER_HOOK_VERSION = "1.2"
 TERSE_REMINDER_MATCHER = ""
 _TERSE_REMINDER_MARKER = "usage-terse-reminder"
 _TERSE_REMINDER_MARKERS = (_TERSE_REMINDER_MARKER, "usage_terse_reminder")
+# Independent, opt-in Claude Code UserPromptSubmit hook.
+QUOTA_AWARE_HOOK_TARGET = Path(os.path.expanduser("~/.claude/usage-quota-aware.py"))
+QUOTA_AWARE_HOOK_VERSION = "1.3"
+QUOTA_AWARE_MATCHER = ""
+_QUOTA_AWARE_MARKER = "usage-quota-aware"
+_QUOTA_AWARE_MARKERS = (_QUOTA_AWARE_MARKER, "usage_quota_aware")
 
 
 def _migrate_bundled_python_commands_if_needed(
@@ -199,9 +205,9 @@ def _migrate_bundled_python_commands_if_needed(
 
 
 def _resolve_resume_source() -> Path:
-    # installer/ is one level below the repo root, where the hook scripts remain.
+    # installer/ is one level below the repo root; hook sources live in usage_hooks/.
     paths = [
-        Path(__file__).resolve().parent.parent / "usage_session_resume.py",
+        Path(__file__).resolve().parent.parent / "usage_hooks" / "usage_session_resume.py",
         Path(sys.executable).resolve().parent.parent / "Resources" / "usage_session_resume.py",
     ]
     for path in paths:
@@ -213,7 +219,7 @@ def _resolve_resume_source() -> Path:
 
 def _resolve_terse_source() -> Path:
     paths = [
-        Path(__file__).resolve().parent.parent / "usage_terse_mode.py",
+        Path(__file__).resolve().parent.parent / "usage_hooks" / "usage_terse_mode.py",
         Path(sys.executable).resolve().parent.parent / "Resources" / "usage_terse_mode.py",
     ]
     for path in paths:
@@ -225,7 +231,7 @@ def _resolve_terse_source() -> Path:
 
 def _resolve_terse_reminder_source() -> Path:
     paths = [
-        Path(__file__).resolve().parent.parent / "usage_terse_reminder.py",
+        Path(__file__).resolve().parent.parent / "usage_hooks" / "usage_terse_reminder.py",
         (Path(sys.executable).resolve().parent.parent / "Resources" / "usage_terse_reminder.py"),
     ]
     for path in paths:
@@ -280,7 +286,7 @@ def _copy_terse_reminder_script() -> None:
 def _write_resume_sidecar() -> None:
     """Mirror i18n.json's rw_prompt/rw_none into a sidecar the stdlib hook can read,
     so the injected wording stays single-sourced and the hook needs no app imports."""
-    from i18n import I18N_PATH
+    from usage_common.i18n import I18N_PATH
 
     try:
         bundle = json.loads(I18N_PATH.read_text(encoding="utf-8"))
@@ -344,7 +350,7 @@ def _write_resume_sidecar() -> None:
 
 
 def _write_terse_sidecar() -> None:
-    from i18n import I18N_PATH
+    from usage_common.i18n import I18N_PATH
 
     try:
         bundle = json.loads(I18N_PATH.read_text(encoding="utf-8"))
@@ -1253,8 +1259,118 @@ def self_heal() -> None:
         _debug_self_heal_failure("resume_hook", exc)
 
     try:
+        _self_heal_quota_aware()
+    except BaseException as exc:
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        _debug_self_heal_failure("quota_aware_hook", exc)
+
+    try:
         _self_heal_terse_mode()
     except BaseException as exc:
         if isinstance(exc, KeyboardInterrupt):
             raise
         _debug_self_heal_failure("terse_hook", exc)
+
+
+def _resolve_quota_aware_source() -> Path:
+    paths = [
+        Path(__file__).resolve().parent.parent / "usage_hooks" / "usage_quota_aware.py",
+        Path(sys.executable).resolve().parent.parent / "Resources" / "usage_quota_aware.py",
+    ]
+    for path in paths:
+        if path.exists():
+            return path
+    raise SystemExit(_t("setup_hook_source_missing", tried=", ".join(map(str, paths))))
+
+
+def _quota_aware_command() -> str:
+    return f"{_shell_arg(_find_system_python())} {_shell_arg(str(QUOTA_AWARE_HOOK_TARGET))}"
+
+
+def _copy_quota_aware_script() -> None:
+    QUOTA_AWARE_HOOK_TARGET.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(_resolve_quota_aware_source(), QUOTA_AWARE_HOOK_TARGET)
+    QUOTA_AWARE_HOOK_TARGET.chmod(
+        QUOTA_AWARE_HOOK_TARGET.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+    )
+
+
+def is_quota_aware_enabled() -> bool:
+    try:
+        entries = _user_prompt_submit_list(_load_settings())
+    except SystemExit:
+        return False
+    return any(_is_hook_entry(entry, _QUOTA_AWARE_MARKERS) for entry in entries or [])
+
+
+def enable_quota_aware() -> int:
+    if not setup_hook._claude_settings_dir_exists():
+        print(_t("setup_no_agents"), file=sys.stderr)
+        return 1
+    _copy_quota_aware_script()
+    settings = _load_settings()
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = {}
+        settings["hooks"] = hooks
+    entries = _user_prompt_submit_list(settings) or []
+    hooks["UserPromptSubmit"] = [
+        kept
+        for entry in entries
+        if (kept := _strip_hook_entries(entry, _QUOTA_AWARE_MARKERS)) is not None
+    ] + [
+        {
+            "matcher": QUOTA_AWARE_MATCHER,
+            "hooks": [{"type": "command", "command": _quota_aware_command()}],
+        }
+    ]
+    _save_settings(settings)
+    print(_t("quota_aware_enabled_msg"))
+    print(_t("setup_claude_restart_required"))
+    return 0
+
+
+def disable_quota_aware() -> int:
+    settings = _load_settings()
+    entries = _user_prompt_submit_list(settings)
+    if entries is not None:
+        kept = [
+            item
+            for entry in entries
+            if (item := _strip_hook_entries(entry, _QUOTA_AWARE_MARKERS)) is not None
+        ]
+        if kept != entries:
+            hooks = settings["hooks"]
+            if kept:
+                hooks["UserPromptSubmit"] = kept
+            else:
+                hooks.pop("UserPromptSubmit", None)
+            if not hooks:
+                settings.pop("hooks", None)
+            _save_settings(settings)
+    if QUOTA_AWARE_HOOK_TARGET.exists():
+        QUOTA_AWARE_HOOK_TARGET.unlink()
+    print(_t("quota_aware_disabled_msg"))
+    return 0
+
+
+def _installed_quota_aware_version() -> str | None:
+    try:
+        for line in QUOTA_AWARE_HOOK_TARGET.read_text(encoding="utf-8").splitlines():
+            if line.startswith("__version__"):
+                return line.partition("=")[2].strip().strip("\"'")
+    except (OSError, UnicodeError):
+        pass
+    return None
+
+
+def _self_heal_quota_aware() -> None:
+    if not is_quota_aware_enabled():
+        return
+    old = _installed_quota_aware_version()
+    if old != QUOTA_AWARE_HOOK_VERSION:
+        _copy_quota_aware_script()
+        _append_self_heal_log(
+            "update_quota_aware_hook", f"{old or 'unknown'} -> {QUOTA_AWARE_HOOK_VERSION}"
+        )

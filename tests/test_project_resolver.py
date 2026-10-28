@@ -7,20 +7,22 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 
-import project_resolver
-from project_resolver import project_from_encoded_path
+from usage_common import project_resolver
+from usage_common.project_resolver import project_from_encoded_path
 
 
 @pytest.fixture(autouse=True)
 def _clear_project_resolver_cache() -> None:
     project_resolver.resolve_project_name.cache_clear()
     project_resolver._resolve_project_name.cache_clear()
+    project_resolver._project_from_encoded_directory.cache_clear()
 
 
 def _completed(
@@ -47,7 +49,7 @@ def test_resolve_project_name_uses_first_worktree_basename(
             ),
         )
     )
-    monkeypatch.setattr("project_resolver.subprocess.run", run)
+    monkeypatch.setattr("usage_common.project_resolver.subprocess.run", run)
 
     assert project_resolver.resolve_project_name("/work/feature") == "main-project"
 
@@ -56,7 +58,7 @@ def test_resolve_project_name_removes_bare_repo_suffix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     run = Mock(return_value=_completed(0, stdout="worktree /Users/me/git/obsidian00.git\n"))
-    monkeypatch.setattr("project_resolver.subprocess.run", run)
+    monkeypatch.setattr("usage_common.project_resolver.subprocess.run", run)
 
     assert project_resolver.resolve_project_name("/work/feature") == "obsidian00"
 
@@ -65,7 +67,7 @@ def test_resolve_project_name_falls_back_for_bare_repo_named_git(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     run = Mock(return_value=_completed(0, stdout="worktree /Users/me/src/.git\n"))
-    monkeypatch.setattr("project_resolver.subprocess.run", run)
+    monkeypatch.setattr("usage_common.project_resolver.subprocess.run", run)
 
     assert project_resolver.resolve_project_name("/work/feature") == "feature"
 
@@ -74,7 +76,7 @@ def test_resolve_project_name_falls_back_for_non_git_repo(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     run = Mock(return_value=_completed(128, stderr="fatal: not a git repository\n"))
-    monkeypatch.setattr("project_resolver.subprocess.run", run)
+    monkeypatch.setattr("usage_common.project_resolver.subprocess.run", run)
 
     assert project_resolver.resolve_project_name("/work/feature") == "feature"
 
@@ -83,7 +85,7 @@ def test_resolve_project_name_falls_back_when_git_is_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     run = Mock(side_effect=FileNotFoundError)
-    monkeypatch.setattr("project_resolver.subprocess.run", run)
+    monkeypatch.setattr("usage_common.project_resolver.subprocess.run", run)
 
     assert project_resolver.resolve_project_name("/work/feature") == "feature"
 
@@ -92,7 +94,7 @@ def test_resolve_project_name_falls_back_on_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     run = Mock(side_effect=subprocess.TimeoutExpired(cmd=["git"], timeout=3))
-    monkeypatch.setattr("project_resolver.subprocess.run", run)
+    monkeypatch.setattr("usage_common.project_resolver.subprocess.run", run)
 
     assert project_resolver.resolve_project_name("/work/feature") == "feature"
 
@@ -103,7 +105,7 @@ def test_resolve_project_name_falls_back_for_unexpected_output(
     stdout: str,
 ) -> None:
     run = Mock(return_value=_completed(0, stdout=stdout))
-    monkeypatch.setattr("project_resolver.subprocess.run", run)
+    monkeypatch.setattr("usage_common.project_resolver.subprocess.run", run)
 
     assert project_resolver.resolve_project_name("/work/feature") == "feature"
 
@@ -112,7 +114,7 @@ def test_resolve_project_name_falls_back_for_empty_cwd(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     run = Mock(return_value=_completed(0, stdout="worktree /work/main\n"))
-    monkeypatch.setattr("project_resolver.subprocess.run", run)
+    monkeypatch.setattr("usage_common.project_resolver.subprocess.run", run)
 
     assert project_resolver.resolve_project_name("") == "unknown"
     run.assert_not_called()
@@ -124,7 +126,7 @@ def test_resolve_project_name_reuses_cached_subprocess_result(
 ) -> None:
     path = tmp_path / "feature"
     run = Mock(return_value=_completed(0, stdout="worktree /work/main-project\n"))
-    monkeypatch.setattr("project_resolver.subprocess.run", run)
+    monkeypatch.setattr("usage_common.project_resolver.subprocess.run", run)
 
     assert project_resolver.resolve_project_name(path) == "main-project"
     assert project_resolver.resolve_project_name(str(path)) == "main-project"
@@ -137,7 +139,7 @@ def test_resolve_project_name_caches_path_resolution(
     resolve = Mock(return_value=Path("/work/feature"))
     run = Mock(return_value=_completed(0, stdout="worktree /work/main-project\n"))
     monkeypatch.setattr(Path, "resolve", resolve)
-    monkeypatch.setattr("project_resolver.subprocess.run", run)
+    monkeypatch.setattr("usage_common.project_resolver.subprocess.run", run)
 
     assert project_resolver.resolve_project_name("/work/feature") == "main-project"
     assert project_resolver.resolve_project_name("/work/feature") == "main-project"
@@ -168,7 +170,7 @@ def test_project_from_encoded_path_resolves_existing_dash_dir(tmp_path: Path) ->
     assert result == "claude-tutorial-video"
 
 
-@pytest.mark.parametrize("drive", ["C", "C:"])
+@pytest.mark.parametrize("drive", ["C-", "C:"])
 def test_encoded_path_root_uses_windows_drive_root(
     monkeypatch: pytest.MonkeyPatch,
     drive: str,
@@ -177,12 +179,55 @@ def test_encoded_path_root_uses_windows_drive_root(
     # becomes "-"), so the drive normally survives only as a bare letter.
     monkeypatch.setattr(os, "sep", "\\")
 
-    root, start = project_resolver._encoded_path_root(
-        [drive, "Users", "runneradmin", "AppData", "Local", "Temp", "alpha"]
+    root, encoded = project_resolver._encoded_path_root(
+        project_resolver._encode(f"{drive}-Users-runneradmin-AppData-Local-Temp-alpha")
     )
 
     assert str(root) == "C:\\"
-    assert start == 1
+    assert encoded == "Users-runneradmin-AppData-Local-Temp-alpha"
+
+
+def _claude_encode(path: Path) -> str:
+    # Mirrors Claude Code's JavaScript `replace(/[^a-zA-Z0-9]/g, "-")`, which
+    # replaces each UTF-16 code unit.
+    units = str(path).encode("utf-16-le")
+    text = "".join(chr(int.from_bytes(units[i : i + 2], "little")) for i in range(0, len(units), 2))
+    return re.sub(r"[^A-Za-z0-9]", "-", text)
+
+
+@pytest.mark.parametrize(
+    "name", [".hidden-app", "my_tool", "生日卡-birthday", "-dash-lead", "🎂cake"]
+)
+def test_project_from_encoded_path_matches_names_claude_flattens(tmp_path: Path, name: str) -> None:
+    # Claude Code turns ".", "_", "-" and non-ASCII letters into "-", which the
+    # "/"-split guess cannot recover; a sibling named like the parent must not win.
+    projects_dir = tmp_path / "projects"
+    real_project = tmp_path / "-Users-me" / name
+    real_project.mkdir(parents=True)
+    encoded = _claude_encode(real_project)
+
+    result = project_from_encoded_path(projects_dir / encoded / "a.jsonl", projects_dir)
+
+    assert result == name
+
+
+def test_project_from_encoded_path_matches_truncated_long_path(tmp_path: Path) -> None:
+    # Claude Code keeps the first 200 encoded characters and appends "-<hash>".
+    projects_dir = tmp_path / "projects"
+    # Size the path below Windows' MAX_PATH limit while keeping it over 200.
+    prefix = "long-project-"
+    padding = 220 - len(_claude_encode(tmp_path / "work")) - len(prefix) - 1
+    name = prefix + "x" * padding
+    real_project = tmp_path / "work" / name
+    real_project.mkdir(parents=True)
+    encoded = _claude_encode(real_project)
+    assert len(_claude_encode(real_project.parent)) < 200 < len(encoded)
+
+    result = project_from_encoded_path(
+        projects_dir / f"{encoded[:200]}-1x2y3z" / "a.jsonl", projects_dir
+    )
+
+    assert result == name
 
 
 def test_project_from_encoded_path_fallback_preserves_dash(tmp_path: Path) -> None:
@@ -209,10 +254,58 @@ def test_resolve_project_name_forces_utf8_git_decoding(
     # A .app launched via LaunchServices has no LANG, so text=True would decode
     # git output as ASCII and crash on non-ASCII repo paths. Lock in utf-8.
     run = Mock(return_value=_completed(0, stdout="worktree /work/main-project\n"))
-    monkeypatch.setattr("project_resolver.subprocess.run", run)
+    monkeypatch.setattr("usage_common.project_resolver.subprocess.run", run)
 
     project_resolver.resolve_project_name("/work/feature")
 
     _, kwargs = run.call_args
     assert kwargs.get("encoding") == "utf-8"
     assert kwargs.get("errors") == "replace"
+
+
+def test_encoded_directory_cache_shares_sessions_and_separates_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    encoded = _claude_encode(real)
+    # Count successful resolution without replacing filesystem behavior.
+    original = project_resolver._encoded_path_root
+    root = Mock(wraps=original)
+    monkeypatch.setattr(project_resolver, "_encoded_path_root", root)
+    projects = tmp_path / "projects"
+    assert project_from_encoded_path(projects / encoded / "one.jsonl", projects) == "real"
+    assert project_from_encoded_path(projects / encoded / "two.jsonl", projects) == "real"
+    assert root.call_count == 1
+    other = tmp_path / "other"
+    assert project_from_encoded_path(other / encoded / "one.jsonl", other) == "real"
+    assert root.call_count == 2
+    assert project_resolver._project_from_encoded_directory.cache_info().maxsize == 4096
+
+
+def test_encoded_fallback_retries_after_directory_created(tmp_path: Path) -> None:
+    projects = tmp_path / "projects"
+    real = tmp_path / "created-later"
+    encoded = _claude_encode(real)
+    path = projects / encoded / "one.jsonl"
+    fallback = encoded.removeprefix("-")
+    assert project_from_encoded_path(path, projects) == fallback
+    assert project_resolver._project_from_encoded_directory.cache_info().currsize == 0
+    real.mkdir()
+    assert project_from_encoded_path(path, projects) == "created-later"
+
+
+def test_encoded_cache_handles_missing_growing_truncated_and_deleted_journal(
+    tmp_path: Path,
+) -> None:
+    projects = tmp_path / "projects"
+    real = tmp_path / "real"
+    real.mkdir()
+    path = projects / _claude_encode(real) / "one.jsonl"
+    assert project_from_encoded_path(path, projects) == "real"
+    path.parent.mkdir(parents=True)
+    for content in ("{}", "{}\n{}\n", ""):
+        path.write_text(content)
+        assert project_from_encoded_path(path, projects) == "real"
+    path.unlink()
+    assert project_from_encoded_path(path, projects) == "real"

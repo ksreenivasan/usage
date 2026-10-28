@@ -107,19 +107,19 @@ def test_registered_panel_i18n_keys() -> None:
 def test_classic_panel_preferred_size() -> None:
     panel = panels.get_panel("classic")
 
-    assert panel.preferred_size() == (364.0, 1132.0)
+    assert panel.preferred_size() == (364.0, 1324.0)
 
 
 def test_catppuccin_panel_preferred_size() -> None:
     panel = panels.get_panel("catppuccin")
 
-    assert panel.preferred_size() == (364.0, 1166.0)
+    assert panel.preferred_size() == (364.0, 1358.0)
 
 
 def test_catppuccin_flavor_is_resolved_after_cached_html_load(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    import prefs
+    from usage_common import prefs
     from wintray import app as wintray
 
     monkeypatch.setattr(prefs, "PREFERENCES_FILE", tmp_path / "usage-preferences.json")
@@ -133,10 +133,10 @@ def test_catppuccin_flavor_is_resolved_after_cached_html_load(
 def test_win95_panel_preferred_size() -> None:
     panel = panels.get_panel("win95")
 
-    assert panel.preferred_size() == (364.0, 1183.0)
+    assert panel.preferred_size() == (364.0, 1392.0)
 
 
-def test_html_panels_place_analyze_and_cli_in_project_header() -> None:
+def test_html_panels_place_analyze_in_project_header() -> None:
     panel_dir = Path(__file__).resolve().parent.parent / "assets" / "panels"
 
     for panel_path in sorted(panel_dir.glob("*.html")):
@@ -144,10 +144,10 @@ def test_html_panels_place_analyze_and_cli_in_project_header() -> None:
         project_index = html.index('data-action="toggle-project-range"')
         footer_index = html.index('<section class="footer"')
         analyze_index = html.index('data-action="analyze"')
-        cli_index = html.index('data-action="toggle-statusline"')
 
         assert project_index < analyze_index < footer_index, panel_path.name
-        assert project_index < cli_index < footer_index, panel_path.name
+        # The status line switch lives in the settings menu, not on the panel.
+        assert 'data-action="toggle-statusline"' not in html, panel_path.name
         assert html.count('data-action="analyze"') == 1, panel_path.name
         assert "data-cli-panel" not in html
         assert "localStorage" not in html
@@ -217,14 +217,27 @@ def test_card_panels_use_shared_core_script(filename: str) -> None:
 
 
 @pytest.mark.parametrize("filename", CARD_PANEL_FILENAMES)
-def test_card_panels_expose_grok_dom_contract(filename: str) -> None:
+@pytest.mark.parametrize("provider", ["grok", "muse"])
+def test_card_panels_expose_quota_dom_contract(filename: str, provider: str) -> None:
     panel_path = Path(__file__).resolve().parent.parent / "assets" / "panels" / filename
     html = panel_path.read_text(encoding="utf-8")
 
-    assert '<section class="card" data-card="grok"' in html
-    assert "data-grok-stale" in html
-    assert "data-grok-stale-age" in html
-    assert "data-grok-stale-tooltip" in html
+    body = html.split("<body>", 1)[1]
+    marker = f'<section class="card" data-card="{provider}"'
+    assert body.count(marker) == 1
+    card = body.split(marker, 1)[1].split("</section>", 1)[0]
+    assert f"data-{provider}-stale" in card
+    assert f"data-{provider}-stale-age" in card
+    assert f"data-{provider}-stale-tooltip" in card
+    assert f'.hide-{provider} [data-card="{provider}"]' in html
+    assert 'data-row="weekly"' in card
+    if provider == "muse":
+        assert 'data-row="session"' in card
+        assert 'data-i18n="muse_name">Muse</h1>' in card
+        assert 'style="--accent: var(--muse)"' in card
+        assert '<svg viewBox="0 0 100 100" fill="currentColor"' in card
+        assert body.index('data-card="grok"') < body.index('data-card="muse"')
+        assert body.index('data-card="muse"') < body.index('data-card="projects"')
 
 
 def test_state_payload_omits_codex_rows_with_empty_titles(
@@ -468,39 +481,29 @@ def test_evaluate_javascript_completion_handler_block_signature() -> None:
 
 
 def test_web_panel_context_menu_removes_navigation_items() -> None:
+    # WebKit hands willOpenMenu plain NSMenuItems tagged through identifier().
+    # A fake item that defines its own lookup method passes even when the real
+    # NSMenuItem has no such method (#42 shipped that way), so use real items.
+    from AppKit import NSMenu, NSMenuItem
+
     import panels.web_panel as web_panel
 
-    class FakeMenuItem:
-        def __init__(self, identifier: str | None) -> None:
-            self.identifier = identifier
-
-        def itemIdentifier(self) -> str | None:
-            return self.identifier
-
-    class FakeMenu:
-        def __init__(self) -> None:
-            self.reload = FakeMenuItem("WKMenuItemIdentifierReload")
-            self.copy = FakeMenuItem("WKMenuItemIdentifierCopy")
-            self.open_link = FakeMenuItem("WKMenuItemIdentifierOpenLinkInNewWindow")
-            self.no_identifier = FakeMenuItem(None)
-            self.items = [
-                self.reload,
-                self.copy,
-                self.open_link,
-                self.no_identifier,
-            ]
-
-        def itemArray(self) -> list[FakeMenuItem]:
-            return self.items
-
-        def removeItem_(self, item: FakeMenuItem) -> None:
-            self.items.remove(item)
-
-    menu = FakeMenu()
+    menu = NSMenu.alloc().initWithTitle_("")
+    for identifier in (
+        "WKMenuItemIdentifierReload",
+        "WKMenuItemIdentifierCopy",
+        "WKMenuItemIdentifierOpenLinkInNewWindow",
+        None,
+    ):
+        item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("", None, "")
+        if identifier is not None:
+            item.setIdentifier_(identifier)
+        menu.addItem_(item)
 
     web_panel._remove_navigation_menu_items(menu)
 
-    assert menu.items == [menu.copy, menu.no_identifier]
+    remaining = [item.identifier() for item in menu.itemArray()]
+    assert remaining == ["WKMenuItemIdentifierCopy", None]
 
 
 def test_build_view_falls_back_to_error_panel_on_failure(

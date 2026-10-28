@@ -22,18 +22,22 @@ usage ships on a rolling basis; security fixes target the **latest release only*
 
 ## Security Design
 
-usage **never calls an LLM API.** Watching your quota never costs you tokens — that's the core design principle of the project. usage also does not upload, track, or phone home with your usage data: your prompts, your conversation content, and your usage numbers never leave your machine.
+usage does not upload, track, or phone home with your usage data: your prompts, your conversation content, and your usage numbers never leave your machine.
 
-**Claude Code and Codex** numbers come entirely from files already on your local disk — the status file Claude Code's statusLine hook writes, and Codex's session logs. Reading them involves no network access at all.
+**Claude Code and Codex** numbers come from files already on your local disk — the status file Claude Code's statusLine hook writes, and Codex's session logs.
 
-**Antigravity** is different, and worth stating plainly: its quota is not on your disk, so usage fetches it over the network. See below.
+**Antigravity** quota is fetched from Google’s official quota endpoint over the network. See below.
+
+**Muse Code** keeps no quota file, so usage runs Muse’s own CLI with the fixed prompt `Reply with OK only.` and reads the quota from its JSON output. The CLI connects to Muse with your existing sign-in, and each check uses a little Muse quota. usage never calls a Muse endpoint itself.
 
 ### Every outbound request
 
 | Purpose | Endpoint | When |
 |---|---|---|
 | Antigravity quota | `https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` | periodically while the app runs, and only if Antigravity is signed in |
+| Antigravity Gemini quota | `https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels` | periodically while the app runs, and only if Antigravity is signed in; called only when the summary has no Gemini group |
 | Antigravity token refresh | `https://oauth2.googleapis.com/token` | when the stored access token has expired |
+| Muse quota | through Muse’s own CLI: `muse exec --json --no-session-log --disable-web-tools`, run in an empty folder | only if Muse is installed and its card isn't hidden: once when there is no reading yet, then only when the reading is over 30 minutes old and you have used Muse since |
 | Service-status banners | `https://status.claude.com/api/v2/components.json`<br>`https://status.openai.com/api/v2/components.json`<br>`https://status.claude.com/api/v2/incidents.json`<br>`https://status.openai.com/api/v2/incidents.json` | every 5 minutes; the incident feed only when a relevant component is abnormal |
 | Token price table | `https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json` | on first need, then every 7 days |
 | Update check | `https://api.github.com/repos/aqua5230/usage/releases/latest` | at most once per 24h, toggleable in the menu |

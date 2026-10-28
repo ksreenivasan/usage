@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 lollapalooza <https://github.com/aqua5230>
+#
+# Part of "usage". Free software licensed under the GNU Affero General Public
+# License v3.0 only; see the LICENSE file for full terms and the warranty disclaimer.
+
+"""usage SessionStart hook — inject terse-mode instructions into a new Claude session.
+
+Claude Code runs this on SessionStart (matcher ``startup|clear``) and pipes the
+session JSON on stdin. Unlike ``usage_session_resume.py``, this hook does not
+inspect transcripts or git state: if stdin parses as a JSON object at all, it
+prints a fixed instruction telling Claude to keep replies terse while leaving
+code, commands, file paths, and error messages untouched.
+
+Stdlib-only and 3.9-safe — same constraint as ``usage_statusline.py`` and
+``usage_session_resume.py``: it may run under macOS's bundled
+``/usr/bin/python3`` (3.9), so no third-party imports, no ``datetime.UTC``, no
+runtime ``X | Y`` types. The prompt wording lives in a sidecar written by
+``setup_hook``; if that file is missing, this script falls back to embedded
+defaults. Any failure exits 0 with no output.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any, cast
+
+__version__ = "1.7"
+
+
+def _read_stdin_utf8() -> str:
+    buffer = getattr(sys.stdin, "buffer", None)
+    if buffer is None:
+        return sys.stdin.read()
+    return cast(bytes, buffer.read()).decode("utf-8", "replace")
+
+
+PROMPT_SIDECAR = Path(os.path.expanduser("~/.claude/usage-terse-prompt.json"))
+_SIDECAR_UNSET = object()
+
+_DEFAULT_INSTRUCTION: dict[str, str] = {
+    "zh-TW": (
+        "（這個對話已開啟「精簡模式」：請在這次對話第一則回覆的最前面提一下這件事——如果你同時收"
+        "到其他要打招呼的指示（例如進度交接），就把「精簡模式已開啟」自然併入那句招呼裡就好，不要"
+        "另外多開一句；如果沒有其他招呼可以搭，就自己說一行「🐾 已開啟精簡模式，回覆會盡量簡短，"
+        "繼續吧！」。整個對話都適用。去掉虛詞贅字、客套語、重複鋪陳與不必要的過渡句；用詞挑"
+        "簡短的（例如「修」不要「針對這個問題實作解決方案」）。精簡是預算，白話是風格：短不等於難"
+        "懂。挑最口語的說法，能用日常字就不要用術語（例如「先存檔」不要「先持久化」）。非用不可的"
+        "技術詞，第一次出現時在後面補十個字以內的白話解釋，之後直接用。工具或子代理的輸出不要原文"
+        "轉貼：先讀懂再用白話重寫成結論，只有程式碼、指令、路徑、錯誤訊息照原文保留。不要比喻。名"
+        "詞化還原成動詞：進行修改→改、做出決定→決定。刪只預告不給資訊的句子："
+        "接下來我要說明、值得注意的是、在深入之前。每句先已知後新知。"
+        "一句只講一件事，一句盡量在三十字內。用主動句：寫「程式送出金鑰」，不寫「金鑰被程式送出」。"
+        "同一個東西從頭到尾用同一個詞，叫過「hook」就別再換成「鉤子」。"
+        "收尾就三件事：做了什麼、成功"
+        "沒、下一步做什麼。不用裝飾性表格；除了開頭那句招呼，內文不放表情符號。不要複述工具名稱或"
+        "呼叫過程，但開工具前用一句話說明要做什麼是可以的。不要自創縮寫（例如「設定」別縮成「設」"
+        "、「函式」別縮成「函」）——這類縮寫斷詞長度跟完整詞一樣，省不到字數，反而讓讀者要多想一"
+        "下，直接用完整詞更省事也更清楚。程式碼、指令、檔案路徑、錯誤訊息一個字都不能省略或改寫。"
+        "遇到安全警示、不可逆操作的確認、或多步驟中省略連接詞會有誤讀風險的情況，這幾種要先恢復完"
+        "整、講清楚，講完再切回精簡語氣。如果使用者明確要求詳細解說、逐步教學，或情境需要完整推理"
+        "，仍以使用者當下的要求為準，不要因為這個模式而省略關鍵資訊。）"
+    ),
+    "en": (
+        "(Terse mode is on for this entire conversation. Mention this at the very start o"
+        "f your first reply — if you're already leading with another greeting (e.g. a res"
+        'ume handoff), fold "terse mode is on" into that same line instead of adding a se'
+        "parate one; if there's no other greeting to fold into, say your own line: \"🐾 Ter"
+        "se mode is on — keeping replies short, let's go!\" Drop filler (just/really/basic"
+        "ally/actually) and pleasantri"
+        "es (sure/certainly/happy to). Prefer short synonyms (big, not extensive; fix, no"
+        't "implement a solution for"). Terse is the budget; plain is the style — short m'
+        'ust never mean cryptic. Pick the everyday word over the jargon one ("save it fir'
+        'st", not "persist it first"). When a technical term is unavoidable, gloss it onc'
+        "e on first use in eight words or fewer, then just use it. Never paste a tool's o"
+        "r subagent's output verbatim: read it, then rewrite it as a plain-language concl"
+        "usion — only code, commands, paths, and error messages stay verbatim. No analogi"
+        'es. Zombie nouns to verbs: "make a decision" to "decide". Cut'
+        ' metadiscourse: "Let me explain", "It\'s worth noting", "Before diving in". Given'
+        " info first in a sentence, new info last."
+        ' One idea per sentence; keep sentences under about 20 words. Use active voice: "the progra'
+        'm sends the key", not "the key is sent". One word for one thing: once you call it "hook", '
+        'don\'t switch to "callback".'
+        " Close with what you did, whether it wo"
+        "rked, and what to do next. No decorative tables, and no emoji in the body beyond"
+        " the opening greeting. Don't recite tool names or narrate calls — but one line o"
+        "f intent before running a tool is fine. Never invent abbreviations (cfg/impl/req"
+        "/res) — the tokenizer splits them the same as the full word, so nothing is saved"
+        " and the reader still has to decode it; use the full word instead. Code, command"
+        "s, file paths, and error messages must stay byte-exact, never trimmed or rewritt"
+        "en. Drop terseness for security warnings, irreversible-action confirmations, and"
+        " multi-step instructions where a fragment or dropped conjunction risks being mis"
+        "read — write those out in full, then resume terse mode after. If the user explic"
+        "itly asks for a detailed walkthrough, step-by-step teaching, or the situation ne"
+        "eds full reasoning, follow that instead — don't drop essential information just "
+        "to stay terse.)"
+    ),
+    "zh-CN": (
+        "（这个对话已开启「精简模式」：请在这次对话第一则回复的最前面提一下这件事——如果你同时收"
+        "到其他要打招呼的指示（例如进度交接），就把「精简模式已开启」自然并入那句招呼里就好，不要"
+        "另外多开一句；如果没有其他招呼可以搭，就自己说一行「🐾 已开启精简模式，回复会尽量简短，"
+        "继续吧！」。整个对话都适用。去掉虚词赘字、客套语、重复铺陈和不必要的过渡句；用词挑"
+        "简短的（例如「修」不要「针对这个问题实现解决方案」）。精简是预算，白话是风格：短不等于难"
+        "懂。挑最口语的说法，能用日常字就不要用术语（例如「先保存」不要「先持久化」）。非用不可的"
+        "技术词，第一次出现时在后面补十个字以内的白话解释，之后直接用。工具或子代理的输出不要原文"
+        "转贴：先读懂再用白话重写成结论，只有代码、指令、路径、错误信息照原文保留。不要比喻。名词"
+        "化还原成动词：进行修改→改、做出决定→决定。删只预告不给信息的句子：接"
+        "下来我要说明、值得注意的是、在深入之前。每句先已知后新知。"
+        "一句只讲一件事，一句尽量在三十字内。用主动句：写「程序发送密钥」，不写「密钥被程序发送」。"
+        "同一个东西从头到尾用同一个词，叫过「hook」就别再换成「钩子」。"
+        "收尾就三件事：做了什么、成功没"
+        "、下一步做什么。不用装饰性表格；除了开头那句招呼，正文不放表情符号。不要复述工具名称或调"
+        "用过程，但开工具前用一句话说明要做什么是可以的。不要自创缩写（例如「配置」别缩成「配」、"
+        "「函数」别缩成「函」）——这类缩写分词长度跟完整词一样，省不到字数，反而让读者要多想一下"
+        "，直接用完整词更省事也更清楚。代码、指令、文件路径、错误信息一个字都不能省略或改写。遇到"
+        "安全警示、不可逆操作的确认、或多步骤中省略连接词会有误读风险的情况，这几种要先恢复完整、"
+        "讲清楚，讲完再切回精简语气。如果用户明确要求详细讲解、逐步教学，或情境需要完整推理，仍以"
+        "用户当下的要求为准，不要因为这个模式而省略关键信息。）"
+    ),
+    "ja": (
+        "（この会話では「簡潔モード」が有効です。最初の返信の冒頭でこのことに触れてください——す"
+        "でに他の挨拶（進捗の引き継ぎなど）を述べる予定がある場合は、「簡潔モードが有効」であるこ"
+        "とをその挨拶に自然に組み込み、別の行を追加しないでください。組み込める挨拶がない場合は、"
+        "自分で一行「🐾 簡潔モードが有効になりました。返答は短くしていきます！」と述べてください"
+        "。会話全体に適用されます。前置き、丁寧すぎる"
+        "言い回し、重複した表現、不必要なつなぎ文を省き、短文や箇条書きで済むなら長い段落に広げな"
+        "いでください。言葉は短い方を選んでください（例:「修正」であって「この問題に対する解決策"
+        "を実装する」ではない）。簡潔さは予算、平易な言葉はスタイルです。短いからといって難解であ"
+        "ってはなりません。専門用語よりも日常的な言葉を選んでください（例：「先に永続化する」では"
+        "なく「先に保存する」）。どうしても専門用語が必要な場合は、最初の使用時に10文字以内で平"
+        "易な説明を補足し、以後はそのまま使用してください。ツールやサブエージェントの出力をそのま"
+        "ま貼り付けないこと。まず理解し、平易な言葉で結論として書き直す。原文のまま残すのはコード"
+        "、コマンド、パス、エラーメッセージだけ。比喩は不要です。名詞化は動詞に戻す（修正を行う→"
+        "修正する）。予告だけの文は削る（「これから説明しま"
+        "す」「注目すべきは」）。各文は既知が先、新情報が後。"
+        "一文に一つの内容だけ、一文はおおむね40字以内。能動態で書く（「キーはプログラムによって送ら"
+        "れる」ではなく「プログラムがキーを送る」）。同じものには最後まで同じ語を使う（一度「hook」"
+        "と呼んだら「フック関数」に言い換えない）。"
+        "最後は、何をしたか、成功したか、次に"
+        "何をするかの3点だけで締めくくってください。装飾的な表は不要です。冒頭の挨拶を除き、本文"
+        "に絵文字は入れないでください。ツール名や呼び出し過程の実況は不要ですが、ツールを使う前に"
+        "何をするかを一言添えるのは構いません。独自の省略語は作らないでください（例:「設定」を「"
+        "設」に略すなど）——トークナイザー上は完全な語と同じ長さになり、何も節約にならず読み手が"
+        "余計に解読する手間が増えるだけなので、完全な語のままの方が得です。コード、コマンド、ファ"
+        "イルパス、エラーメッセージは一文字たりとも省略・書き換えしないこと。セキュリティ警告、不"
+        "可逆操作の確認、接続詞を省くと誤読の恐れがある複数手順の説明では、簡潔さより先に完全な文"
+        "で明確に伝え、伝え終えたら簡潔モードに戻ってください。ユーザーが明確に詳しい解説や段階的"
+        "な説明を求めた場合、または状況的に十分な推論が必要な場合は、その要求を優先し、このモード"
+        "のために重要な情報を落とさないでください。）"
+    ),
+    "ko": (
+        "(이 대화에는 '간결 모드'가 켜져 있습니다. 첫 답변 맨 앞에서 이 사실을 언"
+        "급하세요 — 이미 다른 인사(예: 진행 상황 인수인계)를 할 예정이라면, '간결"
+        " 모드가 켜졌다'는 내용을 그 인사에 자연스럽게 합쳐서 한 줄로 말하고 따로 추"
+        '가하지 마세요. 합칠 인사가 없다면 직접 한 줄로 "🐾 간결 모드를 켰어요. 답'
+        '변을 짧게 이어갈게요!"라고 말하세요. 대화 전체에 적용됩니다. 빈말, 지나친 '
+        "격식, 반복되는 서두, 불필요한 연결 "
+        "문장은 덜어내고, 짧은 문장이나 목록으로 충분하면 긴 단락으로 늘이지 마세요. "
+        '단어는 짧은 쪽을 고르세요 (예: "이 문제에 대한 해결책을 구현하다" 대신 "'
+        '고치다"). 간결함은 예산이고, 쉬운 말은 스타일입니다. 짧다고 해서 이해하기 '
+        '어려워서는 안 됩니다. 전문 용어보다 일상적인 단어를 고르세요(예: "먼저 영속'
+        '화하다" 대신 "먼저 저장하다"). 전문 용어를 꼭 써야 한다면, 처음 사용할 '
+        "때 10글자 이내로 쉬운 설명을 덧붙이고 그 뒤로는 그냥 쓰세요. 도구나 서브에"
+        "이전트의 출력을 그대로 붙여넣지 말 것: 먼저 이해한 뒤 쉬운 말로 결론으로 다"
+        "시 쓰고, 코드·명령어·경로·오류 메시지만 원문 그대로 둔다. 비유는 빼주세요."
+        " 명사화는 동사로 (수정을 진행한다 → 고친다)."
+        ' 예고만 하는 문장은 삭제 ("이제 설명하겠습니다", "주목할 점은"). 각 문'
+        "장은 아는 것 먼저, 새 정보 나중."
+        ' 한 문장에는 한 가지 내용만, 문장은 대략 40자 이내로. 능동문으로 쓰세요 ("키가 프로그램에 '
+        '의해 전송된다" 대신 "프로그램이 키를 보낸다"). 같은 대상은 끝까지 같은 단어로 부르세요 (한'
+        ' 번 "hook"이라고 했으면 "훅 함수"로 바꾸지 않기).'
+        " 마무리는 무엇을 했는지, 성공했는지, 다음"
+        "에 무엇을 할 것인지 이 3가지만 적으세요. 장식용 표는 넣지 마세요. 첫 인사"
+        "말을 제외하면 본문에 이모지는 넣지 마세요. 도구 이름이나 호출 과정을 중계할 "
+        "필요는 없지만, 도구를 쓰기 전에 무엇을 할지 한 줄로 말하는 것은 괜찮습니다."
+        ' 임의로 줄임말을 만들지 마세요 (예: "설정"을 "설"로 줄이는 식) — 토크'
+        "나이저 상으로는 완전한 단어와 길이가 같아서 절약되는 게 없고 읽는 사람만 더 "
+        "해석해야 하니, 완전한 단어를 쓰는 편이 더 낫습니다. 코드, 명령어, 파일 경"
+        "로, 오류 메시지는 한 글자도 생략하거나 바꾸면 안 됩니다. 보안 경고, 되돌릴"
+        " 수 없는 작업의 확인, 접속사를 생략하면 오독 위험이 있는 다단계 설명에서는 "
+        "간결함보다 먼저 완전하고 명확하게 전달한 뒤, 전달이 끝나면 다시 간결 모드로 "
+        "돌아가세요. 사용자가 자세한 설명이나 단계별 안내를 명확히 요청했거나, 상황상 "
+        "충분한 추론이 꼭 필요하다면 그 요구를 우선하고, 이 모드 때문에 핵심 정보를 "
+        "빼먹지 마세요.)"
+    ),
+}
+
+
+def _windows_system_lang() -> str:
+    if os.name != "nt":
+        return ""
+    try:
+        import ctypes
+        import locale as _locale
+
+        windll = getattr(ctypes, "windll", None)
+        if windll is None:
+            return ""
+        lang_id = int(windll.kernel32.GetUserDefaultUILanguage())
+        return _locale.windows_locale.get(lang_id, "") or ""
+    except Exception:
+        return ""
+
+
+def _read_sidecar() -> Any:
+    try:
+        return json.loads(PROMPT_SIDECAR.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+
+def _detect_lang(sidecar: Any = _SIDECAR_UNSET) -> str:
+    # Windows 上的 LANG 多半是 Git Bash / MSYS 帶進來的，不代表使用者的系統語言。
+    keys = (
+        ("USAGE_LANG", "TT_LANG") if sys.platform == "win32" else ("USAGE_LANG", "TT_LANG", "LANG")
+    )
+    for key in keys:
+        value = os.environ.get(key, "").strip()
+        if value:
+            return _normalize_lang(value)
+    raw = _read_sidecar() if sidecar is _SIDECAR_UNSET else sidecar
+    if isinstance(raw, dict):
+        lang = raw.get("lang")
+        if isinstance(lang, str):
+            return _normalize_lang(lang)
+    return _normalize_lang(_windows_system_lang())
+
+
+def _normalize_lang(code: str) -> str:
+    normalized = code.split(".")[0].split("@")[0].strip().lower().replace("_", "-")
+    if normalized in {"zh-tw", "zh-hk", "zh-hant"} or normalized.startswith(
+        ("zh-tw-", "zh-hk-", "zh-hant-")
+    ):
+        return "zh-TW"
+    if normalized in {"zh-cn", "zh-sg", "zh-hans", "zh"} or normalized.startswith(
+        ("zh-cn-", "zh-hans-", "zh-sg-")
+    ):
+        return "zh-CN"
+    if normalized == "ja" or normalized.startswith("ja-"):
+        return "ja"
+    if normalized == "ko" or normalized.startswith("ko-"):
+        return "ko"
+    return "en"
+
+
+def _load_instruction(lang: str, sidecar: Any = _SIDECAR_UNSET) -> str:
+    raw = _read_sidecar() if sidecar is _SIDECAR_UNSET else sidecar
+    if isinstance(raw, dict):
+        table = raw.get(lang)
+        if isinstance(table, dict):
+            instruction = table.get("instruction")
+            if isinstance(instruction, str) and instruction:
+                return instruction
+        table = raw.get("en")
+        if isinstance(table, dict):
+            instruction = table.get("instruction")
+            if isinstance(instruction, str) and instruction:
+                return instruction
+    return _DEFAULT_INSTRUCTION.get(lang, _DEFAULT_INSTRUCTION["en"])
+
+
+def main() -> int:
+    try:
+        payload = json.loads(_read_stdin_utf8() or "{}")
+    except (OSError, ValueError, TypeError):
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+    output: dict[str, Any] = {
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": _load_instruction(
+                _detect_lang(sidecar := _read_sidecar()), sidecar
+            ),
+        }
+    }
+    try:
+        print(json.dumps(output, ensure_ascii=True))
+    except OSError:
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

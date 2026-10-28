@@ -10,20 +10,18 @@ import logging
 import os
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from datetime import time as datetime_time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, Any, NotRequired, Protocol, TypedDict, cast
 
-from i18n import _t
-from installer.statusline_settings import _statusline_enabled
 from loaders import codex_loader, grok_loader, muse_loader
 from loaders.claude_paths import claude_config_dirs
+from loaders.claude_usage import PollOutcome, PollState
 from loaders.codex_paths import codex_home
 from loaders.history_loader import UsageEntry, load_entries
 from menubar.prefs import _hide_claude_enabled, _hide_codex_enabled, _quota_card_order
-from pricing import calculate_cost
 from quota.burn_rate import (
     WARNING_PERCENT_FLOOR,
     WEEKLY_WINDOW_SECONDS,
@@ -31,8 +29,9 @@ from quota.burn_rate import (
     assess_weekly_quota,
 )
 from quota.usage_rate import GROUP_NAMES
-from service_status import ServiceStatus
-from usage_client import PollOutcome, PollState
+from usage_common.i18n import _t
+from usage_common.pricing import calculate_cost
+from usage_common.service_status import ServiceStatus
 from usage_common.time_utils import parse_iso8601_utc_or_raise
 
 if TYPE_CHECKING:
@@ -72,6 +71,7 @@ CLAUDE_COLOR = (244 / 255, 145 / 255, 100 / 255)
 CODEX_COLOR = (88 / 255, 214 / 255, 230 / 255)
 AGY_COLOR = (107 / 255, 154 / 255, 1.0)
 GROK_COLOR = (138 / 255, 138 / 255, 144 / 255)
+MUSE_COLOR = GROK_COLOR
 WARN_COLOR = (255 / 255, 196 / 255, 57 / 255)
 DANGER_COLOR = (255 / 255, 69 / 255, 58 / 255)
 WEEKLY_FORECAST_WINDOW_SECONDS = 30 * 60
@@ -89,6 +89,12 @@ def _bar_color(pct: float, brand: tuple[float, float, float]) -> tuple[float, fl
     return brand
 
 
+@dataclass(slots=True, frozen=True)
+class PeriodTotal:
+    tokens: int = 0
+    cost: float = 0.0
+
+
 @dataclass(slots=True)
 class QuotaRowState:
     title: str
@@ -99,6 +105,13 @@ class QuotaRowState:
     warning: bool = False
     available: bool = True
     reset_text_compact: str = ""
+    reset_done: bool = False
+
+    # Keep percent unchanged for quota notifications; renderers use display_percent.
+
+    @property
+    def display_percent(self) -> float | None:
+        return 0.0 if self.reset_done else self.percent
 
 
 class CodexStaleState(TypedDict):
@@ -107,9 +120,14 @@ class CodexStaleState(TypedDict):
 
 class AgyStaleState(TypedDict):
     ageText: str
+    tooltip: NotRequired[str]
 
 
 class GrokStaleState(TypedDict):
+    ageText: str
+
+
+class MuseStaleState(TypedDict):
     ageText: str
 
 
@@ -132,6 +150,8 @@ class PopoverState:
     agy_session: QuotaRowState
     agy_weekly: QuotaRowState
     agy_group_name: str
+    agy_group_switchable: bool = field(default=False, kw_only=True)
+    agy_weekly_only: bool = field(default=False, kw_only=True)
     grok_weekly: QuotaRowState
     projects: list[tuple[str, int, float | None]]
     projects_yesterday: list[tuple[str, int, float | None]]
@@ -140,22 +160,31 @@ class PopoverState:
     projects_all: list[tuple[str, int, float | None]]
     rate_text: str
     status_text: str
-    today_text: str
-    yesterday_text: str
-    statusline: dict[str, object]
+    today_total: PeriodTotal
+    yesterday_total: PeriodTotal
     service_alerts: tuple[str, ...] = ()
     show_install_button: bool = False
     status_long: bool = False
     hide_claude: bool = False
     hide_codex: bool = False
     hide_agy: bool = True
+    hide_muse: bool = True
+    muse_session: QuotaRowState = field(
+        default_factory=lambda: _missing_row(_t("en", "session_label"), MUSE_COLOR)
+    )
+    muse_weekly: QuotaRowState = field(
+        default_factory=lambda: _missing_row(_t("en", "weekly_label"), MUSE_COLOR)
+    )
+    muse_stale: MuseStaleState | None = None
     hide_grok: bool = True
     codex_stale: CodexStaleState | None = None
     codex_credits: CodexCreditsState | None = None
     agy_stale: AgyStaleState | None = None
     grok_stale: GrokStaleState | None = None
-    card_order: tuple[str, ...] = ("claude", "codex", "agy", "grok")
+    card_order: tuple[str, ...] = ("claude", "codex", "agy", "grok", "muse")
     history_error: HistoryLoadErrorState | None = None
+    refresh_status: tuple[str, bool] | None = None
+    refresh_queued: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,12 +317,14 @@ def _build_history_source_index(now: float) -> HistorySourceIndex:
     return HistorySourceIndex(file_stats=file_stats, last_full_scan_at=now)
 
 
-def _is_indexed_history_path(path: Path) -> bool:
-    if path in _history_file_sources():
+def _is_indexed_history_path(
+    path: Path, file_sources: set[Path], directory_sources: tuple[Path, ...]
+) -> bool:
+    if path in file_sources:
         return True
     if path.suffix != ".jsonl":
         return False
-    return any(path == root or root in path.parents for root in _history_directory_sources())
+    return any(path == root or root in path.parents for root in directory_sources)
 
 
 def _update_history_source_index(
@@ -301,8 +332,10 @@ def _update_history_source_index(
     dirty_paths: set[Path],
 ) -> HistorySourceIndex:
     file_stats = dict(index.file_stats)
+    file_sources = set(_history_file_sources())
+    directory_sources = _history_directory_sources()
     for path in dirty_paths:
-        if not _is_indexed_history_path(path):
+        if not _is_indexed_history_path(path, file_sources, directory_sources):
             continue
         entry = _stat_index_entry(path)
         if entry is None:
@@ -415,8 +448,11 @@ def app_load_history_entries(
 
     entries: list[UsageEntry] = []
     error_key: str | None = None
+    read_failures: list[Path] = []
     try:
-        entries.extend(load_entries(hours_back=0, jsonl_paths=scan.claude_paths))
+        entries.extend(
+            load_entries(hours_back=0, jsonl_paths=scan.claude_paths, read_failures=read_failures)
+        )
     except Exception as exc:
         if os.environ.get("USAGE_DEBUG") == "1":
             logger.warning("Claude project usage load failed", exc_info=True)
@@ -440,8 +476,9 @@ def app_load_history_entries(
             logger.warning("Muse project usage load failed", exc_info=True)
         error_key = _classify_history_load_error(exc)
     app._history_load_error_key = error_key
-    app._history_entries_cache = list(entries)
-    app._history_entries_cache_fingerprint = fingerprint
+    if error_key is None and not read_failures:
+        app._history_entries_cache = list(entries)
+        app._history_entries_cache_fingerprint = fingerprint
     return entries
 
 
@@ -808,7 +845,12 @@ def build_popover_state(
     codex_rows: tuple[QuotaRowState, QuotaRowState],
     agy_rows: tuple[QuotaRowState, QuotaRowState],
     agy_group_name: str,
+    agy_group_switchable: bool = False,
+    agy_weekly_only: bool = False,
     grok_row: QuotaRowState,
+    muse_rows: tuple[QuotaRowState, QuotaRowState] | None = None,
+    muse_stale: MuseStaleState | None = None,
+    hide_muse: bool = True,
     projects: list[tuple[str, int, float | None]],
     projects_yesterday: list[tuple[str, int, float | None]],
     projects_7d: list[tuple[str, int, float | None]],
@@ -817,9 +859,8 @@ def build_popover_state(
     language: str,
     group: int,
     burn_rate_trackers: dict[str, BurnRateTracker],
-    today_text: str,
-    yesterday_text: str,
-    statusline: dict[str, object],
+    today_total: PeriodTotal,
+    yesterday_total: PeriodTotal,
     show_install_button: bool,
     hide_claude: bool,
     hide_codex: bool,
@@ -829,7 +870,7 @@ def build_popover_state(
     codex_credits: CodexCreditsState | None = None,
     agy_stale: AgyStaleState | None,
     grok_stale: GrokStaleState | None,
-    card_order: tuple[str, ...] = ("claude", "codex", "agy", "grok"),
+    card_order: tuple[str, ...] = ("claude", "codex", "agy", "grok", "muse"),
     history_error: HistoryLoadErrorState | None = None,
     service_statuses: tuple[ServiceStatus, ...] = (),
 ) -> PopoverState:
@@ -861,6 +902,7 @@ def build_popover_state(
             CLAUDE_COLOR,
             language,
             forecast_seconds=burn_rate_trackers["claude_session"].forecast_seconds(),
+            allow_unknown_reset=snapshot.data_source == "claude-desktop",
         )
         claude_weekly = _quota_row(
             _t(language, "weekly_label"),
@@ -875,6 +917,7 @@ def build_popover_state(
             ),
             warning_max_seconds=24 * 3600,
             window_seconds=WEEKLY_WINDOW_SECONDS,
+            allow_unknown_reset=snapshot.data_source == "claude-desktop",
         )
         status_value = _status_message_value(outcome, "status_synced", language)
         if snapshot.is_stale or snapshot.data_source != "hook":
@@ -926,7 +969,21 @@ def build_popover_state(
         agy_session=agy_rows[0],
         agy_weekly=agy_rows[1],
         agy_group_name=agy_group_name,
+        agy_group_switchable=agy_group_switchable,
+        agy_weekly_only=agy_weekly_only,
         grok_weekly=grok_row,
+        muse_session=(
+            muse_rows[0]
+            if muse_rows
+            else _missing_row(_t(language, "session_label"), MUSE_COLOR, language)
+        ),
+        muse_weekly=(
+            muse_rows[1]
+            if muse_rows
+            else _missing_row(_t(language, "weekly_label"), MUSE_COLOR, language)
+        ),
+        muse_stale=muse_stale,
+        hide_muse=hide_muse,
         projects=projects,
         projects_yesterday=projects_yesterday,
         projects_7d=projects_7d,
@@ -934,9 +991,8 @@ def build_popover_state(
         projects_all=projects_all,
         rate_text=_t(language, "rate_text", value=group_name),
         status_text=status_text,
-        today_text=today_text,
-        yesterday_text=yesterday_text,
-        statusline=statusline,
+        today_total=today_total,
+        yesterday_total=yesterday_total,
         service_alerts=service_alerts,
         show_install_button=show_install_button,
         status_long=status_long,
@@ -964,13 +1020,25 @@ def _quota_row(
     warning_max_seconds: float | None = None,
     *,
     window_seconds: float | None = None,
+    allow_unknown_reset: bool = False,
 ) -> QuotaRowState:
-    if pct is None or resets_at is None:
+    if pct is None or (resets_at is None and not allow_unknown_reset):
         return _missing_row(title, color, language)
     pct = max(0.0, min(100.0, float(pct)))
+    if resets_at is None:
+        return QuotaRowState(
+            title=title,
+            percent=pct,
+            percent_text=_t(language, "percent_used", value=_format_percent(pct)),
+            reset_text=_t(language, "reset_placeholder"),
+            color=_bar_color(pct, color),
+        )
     time_to_reset = resets_at - now
     warning_seconds: float | None = None
-    if time_to_reset < 60:
+    if time_to_reset <= 0:
+        reset_text = _t(language, "reset_done")
+        warning = False
+    elif time_to_reset < 60:
         reset_text = _t(language, "reset_imminent")
         warning = False
     else:
@@ -1007,11 +1075,14 @@ def _quota_row(
     row = QuotaRowState(
         title=title,
         percent=pct,
-        percent_text=_t(language, "percent_used", value=_format_percent(pct)),
+        percent_text=_t(
+            language, "percent_used", value=_format_percent(0.0 if time_to_reset <= 0 else pct)
+        ),
         reset_text=reset_text,
-        color=_bar_color(pct, color),
+        color=_bar_color(0.0 if time_to_reset <= 0 else pct, color),
         warning=warning,
         available=True,
+        reset_done=time_to_reset <= 0,
     )
     if warning_seconds is not None:
         row.reset_text_compact = _t(
@@ -1038,9 +1109,8 @@ def _missing_row(
 
 
 def _format_percent(value: float) -> str:
-    if value.is_integer():
-        return str(int(value))
-    return f"{value:.1f}"
+    # Whole numbers only, rounded down so 99.7% never reads as an exhausted 100%.
+    return str(int(value))
 
 
 def popover_dimensions(state: PopoverState, panel: UsagePanel | None = None) -> tuple[float, float]:
@@ -1063,6 +1133,32 @@ def popover_dimensions(state: PopoverState, panel: UsagePanel | None = None) -> 
     agy_deduct = agy_card_height if state.hide_agy else 0.0
     grok_card_height = getattr(active_panel, "grok_card_height", 0.0)
     grok_deduct = grok_card_height if state.hide_grok else 0.0
+    # Muse mirrors Agy's two-row geometry; HTMLPanel does not expose the new field yet.
+    muse_card_height = getattr(active_panel, "muse_card_height", 0.0)
+    muse_deduct = muse_card_height if state.hide_muse else 0.0
+    card_heights = (
+        active_panel.claude_card_height,
+        active_panel.codex_card_height,
+        agy_card_height,
+        grok_card_height,
+        muse_card_height,
+    )
+    visible_card_heights = [
+        height
+        for hidden, height in zip(
+            (state.hide_claude, state.hide_codex, state.hide_agy, state.hide_grok, state.hide_muse),
+            card_heights,
+            strict=True,
+        )
+        if not hidden and height > 0
+    ]
+    compact_deduct = 0.0
+    if len(visible_card_heights) >= 4:
+        # B layout: 19px padding + 26px header + 7px gap + 42px quota row.
+        # Keep PanelSpec's original measurements; replace only card estimates.
+        compact_deduct = sum(height - 94.0 for height in visible_card_heights)
+        # A card left with one row spans it across the card at the same height.
+        codex_row_deduct = 42.0 if not state.hide_codex and codex_missing_rows == 2 else 0.0
     install_extra = INSTALL_BUTTON_EXTRA_HEIGHT if state.show_install_button else 0.0
     status_extra = (
         getattr(active_panel, "status_wrap_extra_height", 0.0) if state.status_long else 0.0
@@ -1087,11 +1183,13 @@ def popover_dimensions(state: PopoverState, panel: UsagePanel | None = None) -> 
         + status_extra
         + codex_credits_extra
         + service_alert_extra
+        - compact_deduct
         - claude_deduct
         - codex_deduct
         - codex_row_deduct
         - agy_deduct
         - grok_deduct
+        - muse_deduct
     )
     return width, height
 
@@ -1116,6 +1214,7 @@ def _empty_state(language: str = "en") -> PopoverState:
         agy_session=_missing_row(_t(language, "session_label"), AGY_COLOR, language),
         agy_weekly=_missing_row(_t(language, "weekly_label"), AGY_COLOR, language),
         agy_group_name="",
+        agy_group_switchable=False,
         grok_weekly=_missing_row(_t(language, "weekly_label"), GROK_COLOR, language),
         projects=[],
         projects_yesterday=[],
@@ -1124,9 +1223,8 @@ def _empty_state(language: str = "en") -> PopoverState:
         projects_all=[],
         rate_text=_t(language, "rate_text", value="--"),
         status_text=_t(language, "status_text", value=_t(language, "status_loading")),
-        today_text=_t(language, "today_text", cost="0.00", tokens="0"),
-        yesterday_text=_t(language, "yesterday_text", cost="0.00", tokens="0"),
-        statusline=_statusline_payload(language),
+        today_total=PeriodTotal(),
+        yesterday_total=PeriodTotal(),
         service_alerts=(),
         show_install_button=False,
         hide_claude=_hide_claude_enabled(),
@@ -1137,6 +1235,8 @@ def _empty_state(language: str = "en") -> PopoverState:
         # is already active.
         hide_agy=menubar_agy.find_agy() is None,
         hide_grok=True,
+        muse_session=_missing_row(_t(language, "session_label"), MUSE_COLOR, language),
+        muse_weekly=_missing_row(_t(language, "weekly_label"), MUSE_COLOR, language),
         card_order=_quota_card_order(),
     )
 
@@ -1148,27 +1248,18 @@ def _error_state(message: str, mock: bool, language: str = "en") -> PopoverState
         "status_text",
         value=_t(language, "status_error", message=message),
     )
-    state.today_text = _today_title(mock, language)
-    state.yesterday_text = _yesterday_title(mock, language)
+    state.today_total = _today_total(mock)
+    state.yesterday_total = _yesterday_total(mock)
     state.show_install_button = False
     return state
 
 
-def _statusline_payload(language: str) -> dict[str, object]:
-    return {
-        "enabled": _statusline_enabled(),
-        "enabledText": _t(language, "cli_enabled"),
-        "disabledText": _t(language, "cli_disabled"),
-    }
-
-
-def _today_title(
+def _today_total(
     mock: bool = False,
-    language: str = "en",
     entries: list[UsageEntry] | None = None,
-) -> str:
+) -> PeriodTotal:
     if mock:
-        return _t(language, "today_text", cost="45.20", tokens="50,193,442")
+        return PeriodTotal(tokens=50_193_442, cost=45.20)
 
     try:
         today = datetime.now().astimezone().date()
@@ -1190,18 +1281,17 @@ def _today_title(
     except Exception:
         if os.environ.get("USAGE_DEBUG") == "1":
             logger.warning("today totals load failed", exc_info=True)
-        return _t(language, "today_text", cost="0.00", tokens="0")
+        return PeriodTotal()
 
-    return _t(language, "today_text", cost=f"{total_cost:.2f}", tokens=f"{total_tokens:,}")
+    return PeriodTotal(tokens=total_tokens, cost=total_cost)
 
 
-def _yesterday_title(
+def _yesterday_total(
     mock: bool = False,
-    language: str = "en",
     entries: list[UsageEntry] | None = None,
-) -> str:
+) -> PeriodTotal:
     if mock:
-        return _t(language, "yesterday_text", cost="41.10", tokens="48,200,000")
+        return PeriodTotal(tokens=48_200_000, cost=41.10)
 
     try:
         yesterday = datetime.now().astimezone().date() - timedelta(days=1)
@@ -1218,11 +1308,6 @@ def _yesterday_title(
     except Exception:
         if os.environ.get("USAGE_DEBUG") == "1":
             logger.warning("yesterday totals load failed", exc_info=True)
-        return _t(language, "yesterday_text", cost="0.00", tokens="0")
+        return PeriodTotal()
 
-    return _t(
-        language,
-        "yesterday_text",
-        cost=f"{total_cost:.2f}",
-        tokens=f"{total_tokens:,}",
-    )
+    return PeriodTotal(tokens=total_tokens, cost=total_cost)

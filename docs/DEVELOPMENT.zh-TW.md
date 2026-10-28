@@ -6,7 +6,7 @@
 
 ## 它怎麼拿到你的用量數字
 
-Claude Code 跟 Codex 的數字來自這兩個工具本來就在你本機留下的檔案，不呼叫 Anthropic / OpenAI 的 API。Antigravity 是例外：它的額度不在磁碟上，所以 usage 會用 Antigravity CLI 存下的 OAuth 憑證（macOS Keychain／Windows 認證管理員）向 Google 的額度端點取得，access token 過期時透過 `https://oauth2.googleapis.com/token` 更新。除此之外，會連網的只有三件事：(1) 估算 Codex 成本時需要 token 單價表，如果本機沒有快取（`~/.usage/pricing_cache.json`），會先用內建 fallback 價格立即顯示成本估算，再在背景嘗試從公開的 [LiteLLM 價格表](https://github.com/BerriAI/litellm) 下載並快取，7 天後過期再抓；下載失敗不影響用量百分比顯示，網路恢復後會自動更新價格表；(2) v0.11.0 起每天最多一次到 GitHub Releases API 查有沒有新版（可在「更換面板」選單關掉）；(3) 每 5 分鐘讀取 Claude 與 Codex 的公開 Statuspage 摘要，用來顯示服務狀態警示。完整的對外連線清單見 [SECURITY.md](../.github/SECURITY.md)。
+Claude Code 跟 Codex 的數字來自這兩個工具本來就在你本機留下的檔案。Antigravity 的額度不在磁碟上，所以 usage 會用 Antigravity CLI 存下的 OAuth 憑證（macOS Keychain／Windows 認證管理員）向 Google 的額度端點取得，access token 過期時透過 `https://oauth2.googleapis.com/token` 更新。其他網路活動包括：(1) 估算 Codex 成本時需要 token 單價表，如果本機沒有快取（`~/.usage/pricing_cache.json`），會先用內建 fallback 價格立即顯示成本估算，再在背景嘗試從公開的 [LiteLLM 價格表](https://github.com/BerriAI/litellm) 下載並快取，7 天後過期再抓；下載失敗不影響用量百分比顯示，網路恢復後會自動更新價格表；(2) v0.11.0 起每天最多一次到 GitHub Releases API 查有沒有新版（可在「⚙ 設定」選單關掉）；(3) 每 5 分鐘讀取 Claude 與 Codex 的公開 Statuspage `components.json`，監看 Claude Code／Claude API 與 Codex API，用來顯示服務狀態警示；只有監看的元件異常時才讀取 `incidents.json`。完整的對外連線清單見 [SECURITY.md](../.github/SECURITY.md)。
 
 ### Claude Code 用量
 
@@ -25,21 +25,23 @@ flowchart LR
     B -->|寫入| C[(~/.claude/<br/>usage-status.json)]
     D[usage menu bar / TUI] -->|讀取| C
     D -->|顯示| E[macOS menu bar]
-    F((Anthropic API)) -.x.- D
-    style F stroke:#c0392b,stroke-dasharray:5 5
 ```
 
 讀檔的優先順序：
 
 1. `~/.claude/usage-status.json` —— usage 自己 hook 寫的
 2. `~/.claude/usag-status.json` —— v0.1.x legacy 自動 fallback，新使用者不會碰到
-3. `~/.claude/tt-status.json` —— 備援；給從第三方工具 [stormzhang/token-tracker](https://github.com/stormzhang/token-tracker) 升級過來的使用者，usage 會直接共用它的狀態檔（**注意：跟本專案的整合無關，純粹相容外部社群工具**）
+3. `~/.claude/tt-status.json` —— 唯讀，僅供從第三方工具 [stormzhang/token-tracker](https://github.com/stormzhang/token-tracker) 遷移的使用者備援。
+4. `~/.claude.json` 的 `cachedUsageUtilization` —— Claude Code 快取的配額。
+5. 桌面版的本機 `plan-usage-history.json` —— Claude Code 來源都無法使用時才讀取，不讀憑證、不連網。
+
+同一桌面版設定檔的本機 HTTP 快取，若組織與觀測資料吻合，可提供精確重置時間。快取缺失或無法使用時，重置時間維持未知（`None`），usage 不會編造。
 
 ### Codex 用量
 
 Codex CLI 沒有 statusLine hook 這種機制，所以 usage 採另一條路：掃 Codex CLI 在 `~/.codex/sessions/` 底下留下的 `*.jsonl` 對話紀錄檔。Codex 每次對話會在紀錄裡寫入 `rate_limits`（配額資訊），usage 直接讀裡面的 5 小時跟 7 天用量百分比，不需要自己計算。今日的 token 用量跟成本則從同一份紀錄的 token 統計加總。
 
-要注意的是：Codex 只是**偶爾**才把 `rate_limits` 寫進紀錄，不像 Claude Code 會即時回報，所以這個數字可能**落後你的實際用量**（在網頁上用的更不會進到本機檔）。當本機快照超過 15 分鐘，Codex 卡會標出「約 N 分鐘前」提醒你這是舊資料。維持離線是刻意的——這樣 usage 不會多耗你的 token。
+要注意的是：Codex 只是**偶爾**才把 `rate_limits` 寫進紀錄，不像 Claude Code 會即時回報，所以這個數字可能**落後你的實際用量**（在網頁上用的更不會進到本機檔）。當本機快照超過 15 分鐘，Codex 卡會標出「約 N 分鐘前」提醒你這是舊資料。
 
 沒裝 Codex 或沒這個資料夾的話，這部分會自動隱藏，不會影響 Claude Code 那邊的顯示。
 
@@ -80,7 +82,7 @@ python3 main.py --setup
 setup 具體做了什麼：
 
 - 如果有 Codex，在 `~/.codex/config.toml` 設定 `tui.status_line`
-- 如果有 Claude Code，把 `usage_statusline.py` 複製到 `~/.claude/usage-statusline.py`
+- 如果有 Claude Code，把 `usage_hooks/usage_statusline.py` 複製到 `~/.claude/usage-statusline.py`
 - 如果有 Claude Code，在 `~/.claude/settings.json` 把 `statusLine` 指向這個 hook
 - 如果你本來就有自訂的 Claude Code statusLine，會自動備份到 `settings.usage.previousStatusLine`，不會被蓋掉
 
@@ -121,7 +123,7 @@ python3 main.py
   2. 專案用量卡：列出近期用量前三名的專案，可點右上角按鈕在「今日 / 7 日 / 月」三段之間切換
   3. 最下面那張小卡是目前速率、同步狀態、今日 token 用量與成本估算（Claude 若 log 有提供實際金額則直接顯示；Codex 成本為依 token 數估算）
   4. 兩顆按鈕：「立即更新」、「結束」
-- **面板**：點右上角「更換面板」按鈕可切換面板樣式。目前內建十四款面板——「預設」（簡潔白色卡片）、「駭客任務」（黑底螢光綠＋數位雨動畫）、「視窗 95」（Windows 95 復古介面）、「復古報紙」（米黃報紙風）、「雲圖觀測」（氣象風玻璃卡片）、「午夜水族箱」（深海動畫）、「稜鏡街機」（彩虹全息動畫）、「黑洞視界」（旋轉吸積盤）、「彩繪玻璃」（鉛條分隔的不規則色塊，隨光線掃過如萬花筒轉動）、「摺紙」（同一版面摺成單色三角紙飛機）、「候鳥遷徙」（暮色天空中 V 字雁陣掠過經緯格線，附航線標籤）、「Catppuccin」（官方配色，四款 flavor 全支援）、「世界盃 2026」——FIFA 轉播 HUD 風格，鮮綠球場、棒人球員追球踢球互動動畫、雙向對戰記分條——以及「蝶類圖鑑」，帶有飄動翅膀動畫的藍曬圖風格蝴蝶標本板。World Cup 2026 僅包含 Claude 與 Codex，沒有 Antigravity 卡片也無法拖曳排序。
+- **面板**：點右上角「⚙ 設定」按鈕，選「更換面板」可切換面板樣式。目前內建十六款面板——「預設」（簡潔白色卡片）、「駭客任務」（黑底螢光綠＋數位雨動畫）、「視窗 95」（Windows 95 復古介面）、「復古報紙」（米黃報紙風）、「雲圖觀測」（氣象風玻璃卡片）、「午夜水族箱」（深海動畫）、「稜鏡街機」（彩虹全息動畫）、「黑洞視界」（旋轉吸積盤）、「彩繪玻璃」（鉛條分隔的不規則色塊，隨光線掃過如萬花筒轉動）、「摺紙」（同一版面摺成單色三角紙飛機）、「手繪筆記」（Sketchbook）、「心電圖」（Heart Monitor）、「候鳥遷徙」（暮色天空中 V 字雁陣掠過經緯格線，附航線標籤）、「Catppuccin」（官方配色，四款 flavor 全支援）、「世界盃 2026」——FIFA 轉播 HUD 風格，鮮綠球場、棒人球員追球踢球互動動畫、雙向對戰記分條——以及「蝶類圖鑑」，帶有飄動翅膀動畫的藍曬圖風格蝴蝶標本板。World Cup 2026 僅包含 Claude 與 Codex，沒有 Antigravity 卡片也無法拖曳排序。
 
   <p align="center">
     <img src="matrix.png" alt="駭客任務面板" width="220">
@@ -132,7 +134,7 @@ python3 main.py
   </p>
 
   選擇會記進 `NSUserDefaults`（macOS 內建的偏好設定儲存區），下次開 app 會記得上次選的面板。
-- **更新檢查（v0.11.0+）**：app 啟動會自動到 GitHub Releases 查最新版（24 小時最多一次，避免每次開都被打擾）。發現新版會跳對話框顯示版本＋ release notes，三顆按鈕：「前往下載 / 稍後再說 / 跳過此版本」。「更換面板」選單裡有「自動檢查更新」（可關閉）和「立即檢查更新」兩個項目。
+- **更新檢查（v0.11.0+）**：app 啟動會自動到 GitHub Releases 查最新版（24 小時最多一次，避免每次開都被打擾）。發現新版會跳對話框顯示版本＋ release notes，三顆按鈕：「前往下載 / 稍後再說 / 跳過此版本」。「⚙ 設定」選單裡有「自動檢查更新」（可關閉）和「立即檢查更新」兩個項目。
 - **權限提醒**：第一次啟動時，macOS 可能會問你要不要讓它在背景跑，點「允許」就好。
 
 ### 終端機 TUI 模式
@@ -152,7 +154,7 @@ python3 main.py --tui
 
 ## 報告與深度分析（CLI）
 
-除了選單列跟 TUI，還有一個分析用的 CLI 進入點 `usage_cli.py`，可以匯出 HTML 報告、或在終端機開互動式 dashboard（儀表板，互動式統計面板）：
+除了選單列跟 TUI，還有一個分析用的 CLI 進入點 `usage_app/cli.py`，可以匯出 HTML 報告、或在終端機開互動式 dashboard（儀表板，互動式統計面板）：
 
 <p align="center">
   <img src="report.png" alt="HTML 報告畫面：你的 AI 用量回顧" width="520">
@@ -162,31 +164,31 @@ python3 main.py --tui
 source .venv/bin/activate
 
 # 互動式 dashboard（自動偵測 Claude / Codex 兩邊用量，用方向鍵切換）
-python3 usage_cli.py
+uv run usage
 
 # 只看 Claude Code / 只看 Codex
-python3 usage_cli.py claude
-python3 usage_cli.py codex
+uv run usage claude
+uv run usage codex
 
 # 產生 HTML 報告並用預設瀏覽器打開（預設範圍：近 30 天）
-python3 usage_cli.py report
-python3 usage_cli.py report --today              # 今日
-python3 usage_cli.py report --week               # 本週
-python3 usage_cli.py report --month              # 本月
-python3 usage_cli.py report --all                # 全部資料
-python3 usage_cli.py report --out report.html    # 另存到指定位置
+uv run usage report
+uv run usage report --today              # 今日
+uv run usage report --week               # 本週
+uv run usage report --month              # 本月
+uv run usage report --all                # 全部資料
+uv run usage report --out report.html    # 另存到指定位置
 
 # 純文字統計表
-python3 usage_cli.py daily
-python3 usage_cli.py weekly
-python3 usage_cli.py monthly
+uv run usage daily
+uv run usage weekly
+uv run usage monthly
 ```
 
 HTML 報告包含：每日 / 週 / 月 token 與成本走勢、各專案排名、Top 模型分布。右上角的「分享」按鈕可另存 `.html` 或複製檔案路徑，透過 AirDrop / Mail / Slack / iMessage 把報告傳給同事或主管；對方瀏覽器打開即可閱讀。報告內含「隱藏專案名稱」勾選框（預設打勾，隱私優先），勾選後另存的 HTML 會把所有專案名稱替換成 `Project 1 / Project 2 / ...`，不影響當前螢幕顯示。
 
 ## 給其他工具讀的配額狀態（`usage status`）
 
-`usage status` 會印出目前 Claude Code 與 Codex 的配額，讓其他工具接得上。它只讀選單列本來就在讀的那些本機檔案，不做任何網路呼叫；Antigravity 的配額需要連網才拿得到，所以刻意不放進來。
+`usage status` 會印出目前 Claude Code 與 Codex 的配額，讓其他工具接得上。它讀取選單列本來就在讀的那些本機檔案。JSON 另外包含 Antigravity 快取與 Grok 本機帳務紀錄；文字摘要維持原樣，不發出網路請求。
 
 ```bash
 # 一行人類看的摘要
@@ -212,16 +214,44 @@ JSON 帶有 `schema_version`，之後格式若有變動，接的人可以據此�
       "updated_at": "2026-08-14T06:52:00Z",
       "age_seconds": 480
     },
-    "codex": { "available": true, "five_hour": { "used_percent": null, "resets_at": null, "resets_in_seconds": null }, "seven_day": { "used_percent": 21.0, "resets_at": 1787196910, "resets_in_seconds": 506110 }, "model": "", "updated_at": "2026-08-14T06:52:23Z", "age_seconds": 457 }
+    "codex": { "available": true, "five_hour": { "used_percent": null, "resets_at": null, "resets_in_seconds": null }, "seven_day": { "used_percent": 21.0, "resets_at": 1787196910, "resets_in_seconds": 506110 }, "model": "", "updated_at": "2026-08-14T06:52:23Z", "age_seconds": 457 },
+    "antigravity": {
+      "available": true,
+      "groups": [
+        { "name": "GEMINI MODELS", "five_hour": { "used_percent": 23.7, "resets_in_seconds": 4980 }, "seven_day": { "used_percent": 53.9, "resets_in_seconds": 222180 } }
+      ],
+      "updated_at": "2026-08-14T06:58:00Z",
+      "age_seconds": 120
+    },
+    "grok": {
+      "available": true,
+      "period": { "used_percent": 28.0, "resets_at": 1786873200, "resets_in_seconds": 176000 },
+      "tier": "XPremium",
+      "updated_at": "2026-08-14T06:59:30Z",
+      "age_seconds": 30
+    },
+    "muse": {
+      "available": true,
+      "five_hour": { "used_percent": 24.0, "resets_at": 1786701600, "resets_in_seconds": 10800 },
+      "seven_day": { "used_percent": 42.0, "resets_at": 1787036400, "resets_in_seconds": 345600 },
+      "updated_at": "2026-08-14T06:59:00Z",
+      "age_seconds": 60
+    }
   }
 }
 ```
+
+Muse 只讀 `~/.usage/muse_quota.json`；status 絕不觸發 Muse 探測。`window` 對應 `five_hour`，`weekly` 對應 `seven_day`，`checked_at` 轉成 UTC `updated_at`。快照缺失或無效（含未安裝 Muse）時，回傳 `available: false` 與 `reason: "no_data"`。有效的舊快照仍可讀，重設倒數最低為零。
 
 `resets_in_seconds` 是從 `generated_at` 算到 `resets_at` 還剩幾秒（最小 `0`），`age_seconds` 是 `updated_at` 在 `generated_at` 當下已經過了幾秒；來源欄位是 `null` 時，這兩個也是 `null`。
 
 還讀不到資料的 agent 會回 `"available": false` 加一整組 null，指令本身仍然 exit `0`——沒資料不算錯誤。廠商沒回報的那個視窗會是 `null` 而不是整個欄位消失，接的人不用為了「key 不存在」多寫防呆。
 
-從原始碼安裝的話，可以直接跑 `python3 usage_cli.py status --json`，或先跑一次 `uv sync` 把 `usage` 指令裝進 PATH。
+無法取得額度時也會帶 `reason`：載入器沒回傳資料為 `no_data`，拋出例外為 `error`；只有 Antigravity 在額度快取與 CLI OAuth 權杖檔都不存在時回 `not_signed_in`。可用代理的欄位不變；這是新增欄位，`schema_version` 保持 `1`。
+
+Antigravity 的 `groups` 保留快取順序，`weekly` 對應 `seven_day`，`used_percent` 是 `100 - remaining_percent`，取小數一位。倒數以快取的 `fetched_at` 加上 `resets_in_minutes` 計算，再扣掉目前時間，最小為 `0`；沒有重置時間時為 `null`。Grok 的 `period.resets_at` 是 `period_end` 換算的 Unix 秒數，`tier` 是 `subscription_tier`，沒有方案時為 `null`。兩者的 `updated_at` 都保留 `fetched_at` 原字串；快取過舊仍可讀，倒數會歸零。沒資料時，兩者都沿用 Claude/Codex 的完整 unavailable 欄位形狀。
+
+從原始碼安裝的話，可以直接跑 `uv run usage status --json`，或先跑一次 `uv sync` 把 `usage` 指令裝進 PATH。
 
 ### Starship
 
@@ -248,7 +278,7 @@ set -g status-right '#(usage status --json | jq -r ".agents[\"claude-code\"].sev
 
 LaunchAgent 是 macOS 內建的背景服務管理器（負責「使用者登入後要幫忙啟動哪些程式」），可以讓 usage 在你登入時自動跑起來，不用每次手動啟動。
 
-**最簡單的做法**：點選單列圖示展開 popover，按「⇄ 更換面板」按鈕，選單最下面有「開機自動啟動」一項，勾選即可。.app 版與原始碼版皆適用，不需跑任何指令。
+**最簡單的做法**：點選單列圖示展開 popover，按「⚙ 設定」按鈕，選單最下面有「開機自動啟動」一項，勾選即可。.app 版與原始碼版皆適用，不需跑任何指令。
 
 下面的腳本是給原始碼使用者的另一種安裝方式：
 
@@ -323,7 +353,7 @@ USAGE_LANG=zh-CN python3 main.py   # 簡體中文
 
 ## 一些行為說明
 
-- usage 只在本機讀取 `~/.claude/usage-status.json`、v0.1.x 留下的 `~/.claude/usag-status.json`、`~/.claude/tt-status.json`，以及 Codex 的 session 檔，且絕不為了讀取這些資料呼叫 Anthropic 或 OpenAI 的 API。除此之外會連網的情況：(a) 如果你有使用 Antigravity，其額度來自 Google 的官方額度端點，使用 Antigravity CLI 已儲存的 OAuth 憑證——依據 CLI 版本讀自 macOS Keychain、Windows 認證管理員或本機 token 檔——這是一次元資料呼叫，不消耗模型額度；(b) 讀取公開的 Claude 與 Codex Statuspage.io 頁面來標示故障；(c) 首次估算成本時下載 LiteLLM 價格表（快取 7 天，離線也能用 fallback）；(d) v0.11.0 起每天最多一次到 GitHub Releases API 查有沒有新版（可在「更換面板」選單關閉）。
+- usage 在本機讀取 `~/.claude/usage-status.json`、v0.1.x 留下的 `~/.claude/usag-status.json`、`~/.claude/tt-status.json`，以及 Codex 的 session 檔。網路活動包括：(a) 如果你有使用 Antigravity，其額度來自 Google 的官方額度端點，使用 Antigravity CLI 已儲存的 OAuth 憑證——依據 CLI 版本讀自 macOS Keychain、Windows 認證管理員或本機 token 檔——這是一次額度元資料呼叫；(b) 讀取公開的 Claude 與 Codex Statuspage.io 頁面來標示故障；(c) 首次估算成本時下載 LiteLLM 價格表（快取 7 天，離線也能用 fallback）；(d) v0.11.0 起每天最多一次到 GitHub Releases API 查有沒有新版（可在「⚙ 設定」選單關閉）。
 - Claude Code 沒在跑的時候，狀態檔不會更新；但因為實際用量也不會變（除非重置時間到了），所以顯示的數字仍然是有效的；重置時間過了會自動歸零。
 - 如果狀態檔超過 6 小時沒被更新過，會在狀態訊息標註 `⚠ usage stale Nm`（N 為實際分鐘數），提示資料可能過時。
 

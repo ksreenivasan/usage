@@ -14,7 +14,8 @@ import logging
 import os
 from typing import Any, Protocol
 
-from i18n import _t
+from Foundation import NSObject
+
 from installer import session_hooks, setup_hook
 from installer.statusline_settings import (
     _disable_statusline_settings,
@@ -23,6 +24,8 @@ from installer.statusline_settings import (
     _toggle_statusline_settings,
 )
 from menubar.chrome import _make_alert
+from menubar.new_badge import dismiss_badge
+from usage_common.i18n import _t
 from usage_common.usage_lang import detect_lang
 
 logger = logging.getLogger(__name__)
@@ -200,3 +203,131 @@ def show_forwarder_mode_prompt_if_needed(language: str | None = None) -> None:
         except Exception:
             if os.environ.get("USAGE_DEBUG") == "1":
                 logger.warning("forwarder prompt dismissal failed", exc_info=True)
+
+
+class _PaneApp(_ActionApp, Protocol):
+    def _mark_switch_menu_action(self) -> None: ...
+    def _refresh(self) -> None: ...
+
+
+def toggle_claude_pane(app: _PaneApp) -> None:
+    import threading
+
+    dismiss_badge("claude_pane")
+    app._mark_switch_menu_action()
+    threading.Thread(target=toggle_claude_pane_in_background, args=(app,), daemon=True).start()
+
+
+def toggle_claude_pane_in_background(app: _ActionApp, *, beginner: bool = False) -> None:
+    from installer import claude_pane
+
+    output = io.StringIO()
+    ok = False
+    enabled = False
+    try:
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            if beginner:
+                enabled = not claude_pane.is_claude_beginner_enabled()
+                action = (
+                    claude_pane.enable_claude_beginner
+                    if enabled
+                    else claude_pane.disable_claude_beginner
+                )
+            else:
+                enabled = not claude_pane.is_claude_pane_enabled()
+                action = (
+                    claude_pane.enable_claude_pane if enabled else claude_pane.disable_claude_pane
+                )
+            ok = action() == 0
+    except SystemExit as exc:
+        print(exc.code, file=output)
+    except Exception as exc:
+        print(f"{type(exc).__name__}: {exc}", file=output)
+    app.performSelectorOnMainThread_withObject_waitUntilDone_(
+        "_finishClaudePane:",
+        {"ok": ok, "enabled": enabled, "output": output.getvalue().strip()},
+        False,
+    )
+
+
+def finish_claude_pane(app: _PaneApp, result: dict[str, Any], *, beginner: bool = False) -> None:
+    prefix = "claude_beginner" if beginner else "claude_pane"
+    alert = _make_alert()
+    if result.get("ok"):
+        key = f"{prefix}_enabled_msg" if result.get("enabled") else f"{prefix}_disabled_msg"
+        alert.setMessageText_(_t(app.language, key))
+    else:
+        alert.setMessageText_(_t(app.language, f"{prefix}_action_failed"))
+        alert.setInformativeText_(str(result.get("output") or ""))
+    alert.runModal()
+    app._refresh()
+
+
+class BeginnerMenuTarget(NSObject):  # type: ignore[misc]
+    """Keep Objective-C callbacks in this leaf, without adding app selectors."""
+
+    app: _PaneApp
+
+    @property
+    def language(self) -> str:
+        return self.app.language
+
+    def toggleClaudeBeginner_(self, sender: Any) -> None:
+        import threading
+
+        self.app._mark_switch_menu_action()
+        threading.Thread(
+            target=toggle_claude_pane_in_background,
+            args=(self,),
+            kwargs={"beginner": True},
+            daemon=True,
+        ).start()
+
+    def _finishClaudePane_(self, result: dict[str, Any]) -> None:
+        finish_claude_pane(self.app, result, beginner=True)
+
+
+class QuotaAwareMenuTarget(NSObject):  # type: ignore[misc]
+    """Own the quota toggle and its main-thread completion callback."""
+
+    app: _PaneApp
+
+    def toggleQuotaAware_(self, sender: Any) -> None:
+        import threading
+
+        self.app._mark_switch_menu_action()
+        threading.Thread(target=self._toggle_in_background, daemon=True).start()
+
+    def _toggle_in_background(self) -> None:
+        output = io.StringIO()
+        ok = False
+        enabled = False
+        try:
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                enabled = not session_hooks.is_quota_aware_enabled()
+                action = (
+                    session_hooks.enable_quota_aware
+                    if enabled
+                    else session_hooks.disable_quota_aware
+                )
+                ok = action() == 0
+        except SystemExit as exc:
+            print(exc.code, file=output)
+        except Exception as exc:
+            print(f"{type(exc).__name__}: {exc}", file=output)
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "_finishQuotaAware:",
+            {"ok": ok, "enabled": enabled, "output": output.getvalue().strip()},
+            False,
+        )
+
+    def _finishQuotaAware_(self, result: dict[str, Any]) -> None:
+        alert = _make_alert()
+        if result.get("ok"):
+            key = "quota_aware_enabled_msg" if result.get("enabled") else "quota_aware_disabled_msg"
+            alert.setMessageText_(_t(self.app.language, key))
+        else:
+            alert.setMessageText_(_t(self.app.language, "quota_aware_action_failed"))
+            alert.setInformativeText_(str(result.get("output") or ""))
+        alert.runModal()
+        self.app._refresh()

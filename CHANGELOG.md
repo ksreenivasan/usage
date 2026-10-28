@@ -5,6 +5,275 @@
 All notable changes to usage are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.34.7] - 2026-10-23
+
+### Fixed
+- **Antigravity countdowns no longer slip later when Google skips a quota group.** When one quota response leaves out a model group, usage keeps showing it for up to 30 minutes. The kept reading was treated as brand new, so its reset countdown moved later by however long ago it was fetched. It now counts down from the original reading.
+- **The Gemini ⇄ button can always switch back.** With only the Claude / GPT and Argon groups present, switching to Argon left the button stuck there, because the next press asked for Gemini and fell back to Argon again. The button now cycles only through the groups Antigravity reports.
+- **Argon's compact card shows the right rows after switching groups.** Argon has a weekly limit only, so its compact card hides the 5-hour row. Switching groups on macOS kept the previous group's choice until the next refresh, and the Windows tray never applied it.
+- **Saved usage history no longer loses days when a report is built during a background save.** Both write `~/.usage/usage_snapshot.json` and `~/.usage/year_ledger.json`; if they overlapped, the one that finished last could drop what the other had just saved.
+
+## [0.34.6] - 2026-10-23
+
+### Changed
+- **The usage report shows where each dispatch quota went.** The dispatch ledger's seven-column table is now "Where your dispatch quota went (last 7 days)": one block per quota, for Codex and each Antigravity model group, with how much of it is used this week, the conversations whose dispatched work used it (top five, then "N more"), and the rest as "Other (your own use, or no dispatch record found)". Antigravity groups each have their own weekly quota and are no longer added together; the old table could total more than 100%. When all of Codex's usage came before its reset, the block says so in one line.
+
+### Fixed
+- **The Muse card records a used-up weekly allowance as the weekly limit.** Muse sends the same "Subscription quota exhausted" error for both limits, and v0.34.5 always recorded it as the 5-hour window. A used-up week showed "Session 100%, resets in 3 days" while the weekly row kept an old reading. A reset more than 5 hours away now marks the weekly row as 100% with that reset time.
+- **Wrapped captions say "over the past year".** The data covers a rolling 53 weeks, not the calendar year.
+
+## [0.34.5] - 2026-10-21
+
+### Fixed
+- **The Muse card shows a used-up 5-hour window even when Muse sends no numbers.** Once the window runs out, Muse usually refuses the quota check with a "Subscription quota exhausted" error that only says when the window resets. The card now shows the window as 100% with that reset time. The error has no weekly figure, so the weekly percentage stays from the last reading and the card keeps its "last checked" badge.
+
+## [0.34.4] - 2026-10-21
+
+### Fixed
+- **The Muse card stays current after a 5-hour window runs out.** Muse reports an exhausted window as more than 100% used (for example 104%), and `usage` threw those readings away. The card kept the last reading under 100% with a stale-age badge until the window reset; it now shows the window as full.
+
+## [0.34.3] - 2026-10-21
+
+### Changed
+- **Windows: the taskbar label stops scanning taskbar buttons while the screen is locked.** The scan runs every 2 seconds through UI Automation and is the main suspect in an unexplained crash that happened while Windows was locked (refs #202). Nothing changes while unlocked. This is a mitigation, not a confirmed fix.
+- **Auto-start 5-hour Session sends a lighter ping and no longer clutters your resume list.** The Claude ping now loads no tools or MCP servers and is not saved as a session; the Codex ping runs with `--ephemeral`. Each ping used to load about 20k input tokens and leave an "ok" conversation in `claude --resume` and `codex resume`.
+
+## [0.34.2] - 2026-10-21
+
+### Security
+- **The Windows build ships Pillow 13.0.0.** Pillow 12.3.0, which draws the Windows tray icon and taskbar quota label, had nine known vulnerabilities in its image decoders, one of them critical. `usage` only draws its own icons and never opens images from elsewhere, but installing `usage-cli[windows]` from PyPI now requires Pillow 13.0.0 or later as well.
+
+### Fixed
+- **The Gemini ⇄ button hides again when Antigravity has only one quota group.** v0.34.1 restyled it in the default panel and the new style overrode its hidden state, so it showed a button that did nothing.
+- **Heart Monitor's English footer buttons keep their text inside.** "Set Up Status Line" did not fit next to Refresh and Quit; button labels now wrap.
+
+## [0.34.1] - 2026-10-21
+
+### Changed
+- **The panel's top-right button is now "⚙ Settings".** It opened the whole app menu but was labeled "Switch Panel"; Switch Panel is still in the menu.
+- **The status line switch moved into the Settings menu.** The "Terminal" button next to Today and Report turned off the status line that feeds the Claude quota, one mis-click away from the range buttons. It is now **Settings → Claude Code → Sync quota via status line** on macOS and Windows, with a tooltip that says what turning it off does. The Projects card keeps Today and Report, in two equal columns in every theme.
+- **Quota colors stay quiet until a quota is nearly used up.** Percentages and bars no longer turn yellow at 50%; only 80% and above turns red. The default panel shows percentages in the plain text color and keeps each tool's color on its bar, so a low Claude percentage no longer looks like a warning.
+- **Quota percentages are whole numbers.** Antigravity showed `70.6%` next to whole-number cards. Values round down, so 99.7% never reads as an exhausted 100%.
+- **The Today / Yesterday total matches the project rows.** Its tokens use the same large green numbers with the cost beside them, in every theme.
+- **The default panel is cleaner.** A smaller Settings button, Today as the lead button and Report as the quiet one, a centered divider between Session and Weekly, muted labels, thinner bars with a visible 80% mark, aligned project numbers, and status chips that no longer look like buttons.
+
+### Fixed
+- **Light mode in the default panel is readable again.** Refresh Now and the top project's rank used white text on a light background; white app icons now have an outline on white cards.
+- **The Windows Muse quota check no longer flashes a console window.**
+
+## [0.34.0] - 2026-10-21
+
+### Added
+- **Muse Code has a quota card.** It shows Muse's 5-hour Session and weekly quota with reset countdowns in all 15 quota themes, with a menu bar item, a hide toggle, and the same near-limit, used-up and restored notifications as Antigravity. Muse keeps no quota file, so `usage` asks Muse itself with one small background request, without a session log and from an empty folder. It checks once when there is no reading yet, then only when the reading is over 30 minutes old and you have used Muse since. Each check uses a little of your Muse quota. A failed check waits for new Muse activity before trying again. Hiding the Muse card stops the checks, and the card hides itself when Muse isn't installed.
+- **Muse quota shows up wherever the other quotas do.** The Claude Code side pane, `usage status --json`, the multi-agent CLI dashboard, Quota-Aware Mode, and the Windows tray (card, tooltip, hide toggle, and notifications) now include Muse. They only read the last saved reading and never start a Muse check.
+
+### Changed
+- **Four or more quota cards switch to a compact layout.** Four full cards no longer fit on a laptop screen, so every quota card shrinks: a smaller header, Session and weekly side by side, and shorter percent and reset text. The Projects title shrinks to match. Three or fewer cards look the same as before.
+- **The menu bar shows at most three tools.** With Claude Code, Codex, Antigravity, Grok and Muse all on, the strip got too wide and could slide behind the notch. It now keeps the three with the highest Session usage, in the usual order. The panel still shows every card.
+
+### Fixed
+- **Stale-data warnings are readable in the Windows 95 and Cloud Observation themes.** The red warning sat directly on the Windows 95 blue title bar, and the pale amber one on Cloud Observation's sky-blue cards. Both now have enough contrast. In World Cup 2026, the English MATCH STATS heading is no longer cut off by the buttons next to it.
+- **Windows saves the quota card order again.** The tray accepted a new order only when it listed exactly the Claude, Codex, and Antigravity cards, so once the Grok card was in the panel, dragging cards into a new order was not saved. It now uses the same check as macOS.
+- **Auto-start 5-hour Session no longer runs your own hooks.** Its background `claude -p` and `codex exec` pings fired every hook you had set up, such as SessionStart, UserPromptSubmit and Stop hooks, Codex's `hooks.json`, and the `notify` program in Codex's `config.toml`. A hook that sends a notification or saves the conversation ran once for every ping. Claude Code pings now load a settings file with `disableAllHooks`; Codex pings turn off `features.hooks` and `notify`. Antigravity pings are unchanged.
+
+## [0.33.10] - 2026-10-16
+
+### Fixed
+- **Windows installs hooks and keeps them up to date again.** Since v0.33.2 the Windows build left the hook scripts out of the folder the installer reads, so first-run setup and the resume, terse and quota-aware toggles silently did nothing, and existing hooks stopped updating. macOS was not affected.
+
+## [0.33.9] - 2026-10-16
+
+### Added
+- **The Antigravity card can switch to the Gemini 4 Argon quota.** The group toggle now cycles Gemini → Claude / GPT → Argon. Argon has a weekly limit only, so its 5-hour row says so. The Claude Code side pane and the Antigravity status line leave Argon out.
+
+### Changed
+- **Report rows show their share as a faint tint across the row.** The thin bars along each row's bottom edge read as crooked underlines; rows now fill with the tool's color up to their share, with spacing instead of separator lines.
+
+### Fixed
+- **Antigravity shows its Gemini weekly quota again.** Google's quota API stopped reporting it, so usage now asks the Antigravity CLI itself (`agy -p /usage`, which makes no model call) and falls back to the API when the CLI is unavailable.
+- **The quota reminder no longer makes Claude think Antigravity is used up.** Each line names the tool and models it limits, a spent Antigravity group is followed by the groups that still have quota, and the reminder ends with Claude Code's own usage.
+- **Grok usage has an API-equivalent value again.** Grok models now match their xAI price entries instead of counting as $0.
+- **The usage report no longer contradicts itself.** The weekly summary names the completed weeks it compares, a partial first week no longer produces changes like +980%, the converted amount is called "API equivalent" everywhere, Wrapped notes which days have saved prices, the "All" range explains that earlier days only have daily totals, the dispatch ledger labels its columns as weekly quota shares, and rankings say they are by tokens.
+
+## [0.33.8] - 2026-10-16
+
+### Fixed
+- **Antigravity shows your Gemini quota again.** Google's quota summary no longer returns the Gemini group. usage now reads Gemini's five-hour quota from the model list. Google does not currently report its weekly quota; the card labels it as not reported. While the app is running, the Antigravity CLI status line uses these numbers too.
+- **The Antigravity 5-hour row says "Paused" once the weekly quota is used up.** Google pauses the 5-hour limit at that point, and the row used to read "0% used / Quota full", which looked usable.
+
+## [0.33.7] - 2026-10-16
+
+### Fixed
+- **The Antigravity group toggle is hidden when there is nothing to switch to.** v0.33.6 meant to hide it when Google's quota response carries only one model group, but the change missed the panel code the app loads, so every panel still showed a toggle that did nothing. When the Gemini group comes back, the toggle reappears on the next refresh and your saved choice applies again.
+
+## [0.33.6] - 2026-10-16
+
+### Changed
+- **The usage report explains its numbers instead of leaving units to guess.** Token composition and cache hit rate now sit in a visible section after tools rather than the collapsed appendix. The daily chart labels the peak's date, marks month starts and uses rounder axis steps; weekly rows show their date range; project hotspots add a share column and an "Other projects" row; the dispatch ledger and persona peak state what their numbers count.
+
+### Fixed
+- **Reports keep usage older than 30 days even if you rarely open them.** Claude Code deletes transcripts after 30 days by default, and usage only saved its long-term history when a report was built. The menu bar and Windows tray apps now save the last 45 days every 6 hours in the background, and reports fill days missing from transcripts from that saved history. Filled days count toward totals, trends, tools and projects, but not sessions, token composition or cache hit rate. When moving to a new computer, copy `~/.usage/` as well.
+- **The Antigravity group toggle no longer stops working.** When one quota response skipped a model group, the card had nothing to switch to for five minutes. A group seen in the last 30 minutes is now kept. When the quota really has only one group, every panel and the Windows tray hide the toggle, and your group choice is kept for when both return.
+
+## [0.33.5] - 2026-10-16
+
+### Fixed
+- **Windows tray-icon menus stay outside the taskbar.** Right-clicking the tray icon now uses the same taskbar-aware position and foreground owner as the quota label, preventing the taskbar from covering the menu. Left-click behavior is unchanged.
+- **Windows: hardened three native calls that may relate to crashes while the screen is locked (#202).** The tray icon is no longer redrawn by two threads at once, Windows handles are no longer cut to 32 bits, and the file watcher waits for a pending read to finish before closing it. The crash cause is not yet confirmed.
+
+## [0.33.4] - 2026-10-15
+
+### Fixed
+- **Windows: usage no longer leaves a WebView2 folder in %TEMP% after each abnormal exit.** Each crash, forced close or shutdown with Windows previously left about 2.5 MB behind. usage now reuses one dedicated folder under `~/.usage/webview`.
+- **Sonnet 5.5 cache reads in the offline price table cost $0.10 per million tokens.** The table, used only when the LiteLLM download fails, still charged $0.20, so offline Sonnet 5.5 spending was overstated.
+- **Session resume no longer hands over another open window's work.** With several Claude Code windows in one project, a new window picked up whichever session was written last, often a neighbour still running. Sessions another window has open and wrote to in the last 10 minutes are now skipped; a window you just closed is still handed over. Background-task notices, `!` shell runs and bare slash commands no longer show up as your recent requests.
+- **Beginner Mode's terms stay up while background agents work.** Since Claude Code 2.1.299, a subagent or teammate starting its own turn also signals a new turn, which cleared the terms above the prompt and dropped the ones still being picked. Only a new turn in the main conversation clears them now.
+
+## [0.33.3] - 2026-10-09
+
+### Performance
+- **usage uses far less CPU while it sits in the menu bar.** With the panel closed, a refresh took about 1.2 s of CPU and could run three times a minute, about 6% CPU on average while you work. Incremental history scans no longer list every Muse session again for each changed file, Muse sessions are reparsed only when they change, and resolved Claude project names are cached. A steady-state refresh now takes about 0.13 s.
+- **Closing the panel frees the memory of panels you browsed.** Each panel you switched to kept its own WebKit process after the panel closed, up to six and about 400 MB. Now only the current panel stays loaded once the panel closes. Switching while it is open is unchanged.
+
+### Fixed
+- **Claude Desktop quota remains available when plan history stops updating.** A fresh local HTTP quota response for the latest history organization can now supply percentages and reset times even after the history sample expires. Expired responses, invalid organizations and another account's cache still return no data.
+- **The panel's right-click menu no longer offers Reload.** The v0.22.5 fix looked up the wrong menu item property, so right-click > Reload still blanked the panel (#42).
+- **Claude Haiku 5.5 has prices and a short name.** Its cost no longer drops out when the online price table is unreachable, and reports show "Haiku 5.5" instead of the raw model ID. The Auto-start 5-hour Session tooltip and dialog now name Gemini 3.8 Flash Low for Antigravity.
+- **Claude Desktop quota finds responses in Chromium's follow-on cache files.** Once the cache outgrew its first entry file, a fresh quota response could sit in a follow-on file and be missed.
+- **A Claude log that cannot be read is retried on the next refresh.** A brief lock, for example an antivirus scan on Windows, used to leave that file's usage missing until the file changed or usage restarted.
+- **Codex usage after a mid-session model switch is priced with the model that ran it.** Earlier turns were priced as the session's latest model. Codex history is reparsed once after this update.
+
+## [0.33.2] - 2026-10-08
+
+### Fixed
+- **Project names show for folders with dots, underscores, non-English names or emoji.** Claude Code turns every symbol in a project path into `-`, so these projects showed the whole encoded string or the parent folder's name. usage now matches the encoded name against the real folders, including long paths Claude Code shortens.
+- **Quota-Aware Mode only asks about the quota a task uses.** An exhausted Antigravity model group made Claude ask whether to wait before unrelated work. The reminder now says each quota and model group is separate. Quota-Aware hook 1.1; the installed copy updates the next time you open the app.
+- **Side pane session toasts name the project.** A toast that a session finished now starts with the project name, so you can tell which window it was.
+
+## [0.33.1] - 2026-10-07
+
+### Added
+- **Claude quota shows even with only Claude Desktop installed.** When Claude Code quota files are unavailable, usage reads Claude Desktop's local plan history, including Windows Microsoft Store installs. It shows session and weekly percentages, plus exact reset times from a matching, recent local HTTP cache response when available. No credentials or quota API requests; unknown reset times remain unknown. Includes observation age and stale-data handling.
+- **On Windows, right-clicking the taskbar quota label opens the menu.** It is the same menu as the tray icon, shown outside the taskbar so it cannot cover the menu. Adapts to taskbars on any screen edge; left-click still opens the panel.
+- **Windows gets Beginner Mode and Quota-Aware Mode switches.** They sit with the side pane under a **Claude Code** submenu in the tray menu, as on macOS. On Windows, Quota-Aware Mode now also sees Codex and Antigravity quota.
+
+## [0.33.0] - 2026-10-07
+
+### Added
+- **Beginner Mode helps you read Claude Code's answers.** After an answer, up to three technical terms appear above the prompt, each with a one-line plain explanation in your UI language. Press 9 to mark them understood; skipped terms come back after 1, 3, then 7 days. `/terms` opens your term history. Picking terms asks Claude Haiku through your Claude Code, so it uses a little Claude quota, and it pauses while your 5-hour quota is at 90% or more. macOS, off by default.
+- **Beginner Mode quizzes you on terms you understood.** A new conversation can open with a one-question multiple-choice quiz on a term you marked understood, 7, 21, then 60 days later, at most one a day. A wrong answer puts the term back in the hints.
+- **Quota-Aware Mode tells Claude when quota runs low.** When a 5-hour quota passes 80%, 90% or 95%, or a weekly quota passes 95%, Claude Code gets one line with what is left and when it resets. Before a big task, Claude tells you and lets you pick a smaller part or wait. It covers Claude Code, Codex and Antigravity, says each level once per conversation, and makes no extra model calls. macOS, off by default.
+
+### Changed
+- **Claude Code switches have their own submenu.** Side pane, Beginner Mode and Quota-Aware Mode sit under a **Claude Code** submenu in the menu bar menu, like the panel themes.
+- **The rate label compares you with yourself.** Idle, Normal, Active and Heavy now come from your own last 30 days: hours below your 25th percentile are Idle, and only your top 5% are Heavy. Fixed limits labelled a normal Opus session Heavy almost all the time. Until there are 24 hours of history, the old limits apply.
+
+## [0.32.6] - 2026-10-07
+
+### Changed
+- **Context color now accounts for window size.** The figure turns yellow at 50% or 200K tokens and red at 80% or 400K tokens, whichever comes first. On a 1M window, yellow now appears at about 20%. 200K windows are unchanged.
+- **Side pane colors match the status line.** The Claude Code side pane moves from 70% / 85% to the same rule.
+- **Terse mode uses shorter sentences.** Replies keep one idea per sentence, use active voice and consistent terms, and follow a length limit per language: about 20 words in English, 30 characters in Chinese, 40 in Japanese and Korean. The terse hook is now 1.7; installed copies update on the next app launch.
+
+### Added
+- **Context breakdown in the status line.** When the context figure turns yellow or red, the status line shows the image count and the estimated share of file reads and command output, for example `Images 3 · Files & commands 22%`. A high share suggests starting a new conversation. This segment is dropped first when space runs out. The status line hook is now 1.14; installed copies update on the next app launch.
+- **Release notes after an update.** The first launch after an update shows what changed in that version, once. Fresh installs skip it. If the app is offline, it tries again on the next launch. macOS and Windows.
+- **Release notes in your language.** Update alerts list one line per change. Chinese users see Traditional Chinese; other languages see English. This applies to the update alert from the version after this one, because the alert is drawn by the version you already have.
+
+### Fixed
+- **The app's code signature is valid again.** The build re-signs the app after it removes bytecode caches, so `codesign --verify` passes on downloaded copies.
+
+## [0.32.5] - 2026-10-06
+
+### Added
+- **Status line:** for 10 minutes after Claude Code's prompt cache misses, the cache segment says why, for example `Cache:62% missed:tools changed`. It covers all 17 causes Claude Code reports (model, effort, fast mode, tools, system prompt, idle past the 5-minute or 1-hour TTL, likely server-side, and more) in all five languages; an unknown cause is left out. The reason is the first part dropped when the line is too narrow. Requires Claude Code 2.1.260 or newer. The status line hook version is now 1.9, so installed copies update on the next app launch.
+- **Development:** `scripts/check_upstream.py` checks the formats usage depends on against the real files on this machine before a release: the Claude status line payload and transcripts, Codex sessions and SQLite files (including a newer-numbered file such as `state_6.sqlite`), the Antigravity conversation database and quota cache, the Grok log, installed hook copies (including a source edited without bumping its version), and the watched Statuspage components. Each check reports OK, NEW, BROKEN, or NO_DATA.
+
+### Changed
+- **Claude Code side pane:** each section's title and count now sit on the box's top border, saving one row per section. The title still collapses the section when clicked.
+- **README:** the prompt cache description now matches the status line, which no longer shows an expiry countdown.
+
+### Fixed
+- **Claude Code side pane:** the background jobs box could hide one recently finished job when fewer than four jobs were listed.
+- **Claude Code side pane:** the pane's own tests pass again on Claude Code 2.1.289, and `claude plugin validate` no longer fails on its state contract.
+
+## [0.32.4] - 2026-10-05
+
+### Added
+- **Windows:** choose Claude Code or Codex as the tray quota source in the tray or panel menu. The selection is remembered; Codex falls back to its weekly quota when no session window is reported.
+- **Windows:** optionally show a transparent remaining-quota label beside the notification area, with DPI scaling, light/dark theme support, and fullscreen hiding. It moves left of taskbar buttons and the News and interests weather widget, with an outside fallback when space runs out. Click the label to toggle the panel without blocking the UI thread.
+
+### Changed
+- **Windows:** a failed **Check for Updates** now says why: you are offline, GitHub is limiting requests (HTTP 403/429), GitHub returned an error, or its response could not be read. The message box offers **Retry/Cancel**.
+
+### Fixed
+- **Updates are found while usage stays open:** On macOS and Windows, usage now re-evaluates automatic checks every hour instead of checking only at launch, still respecting the existing 24-hour check interval, dismissal cooldown and skipped version, and retrying failed checks after 1, 1, 2, 4 and 6 hours. Finding a new version opens the same update dialog as the launch check. Automatic checks also resume for anyone who turned them off with the old setting, which was removed in June and could not be turned back on.
+- **macOS notification banners appear while usage is in front:** Banners now appear even when usage is the foreground app, and denied notification permission is recorded in the log file.
+- **Expired Antigravity sign-in is visible:** The quota card shows "Sign-in expired" with a hint to sign in again, and `usage status --json` reports `not_signed_in`, which the side pane already displays. The warning clears after the next successful quota check.
+- **Auto-start failures are visible:** On macOS and Windows, **Auto-start 5-hour Session** records each attempt's result, including a missing command, timeout, non-zero exit with the command's last output line or an exception, and retries once after 10 minutes if the window is still idle. A final failure adds ` ⚠` to the existing menu row with the reason on hover and sends a notification when usage alerts are on; the same error is not notified again for every window, and a successful attempt clears the warning and notification suppression.
+- **Antigravity auto-start works again:** The keeper asked Antigravity for Gemini 3.5 Flash (Low), which it no longer offers, so every ping exited with an error. It now uses Gemini 3.8 Flash (Low).
+- **Stopped background jobs show the right status:** The side pane now shows "stopped" instead of "completed" when a background job's notification says killed, stopped or cancelled.
+- **Token Saver warns when Codex will not run it:** Codex 0.129 and newer require trusted hooks; when usage's session-start hook is untrusted or disabled, the existing **Token Saver** row adds ` ⚠` with a hover hint to trust it through `/hooks` in Codex. usage only reads the trust settings and never grants trust itself; `usage doctor` also reports the state.
+
+## [0.32.3] - 2026-10-05
+
+### Changed
+- **Quota shows 0% once its reset time passes:** After a 5-hour or weekly window resets, the menu bar, popover panels, Windows tray and Claude Code side pane show 0% with "Reset" until fresh data arrives, instead of the last percentage. Notifications and history still use the real reading.
+- **Refresh gives feedback:** The popover status chip shows "↻ Refreshing…" while a refresh started from the Refresh button runs (macOS and Windows).
+
+### Fixed
+- **Side pane no longer calls a conversation done while its background jobs run:** A conversation whose main turn ended but whose background jobs are still running keeps the spinner and only toasts "Done" after they finish.
+- **Side pane shows every running background job:** The jobs block used to keep only the last four rows; running jobs now always show, and finished ones fold behind a "+N more" toggle.
+- **Side pane lists every kind of background work:** Plain background shell commands, monitors and workflows now appear in the jobs block (from Claude Code's own in-flight list at the end of each turn), not just codex / agy / grok / muse dispatches and subagents, and they count toward keeping a conversation busy.
+
+## [0.32.2] - 2026-10-05
+
+### Added
+- **Claude Code side pane notifications:** A toast appears when another Claude conversation finishes or starts waiting for you. It fires only when the next refresh still shows the same state, so brief flips don't ping.
+- **Session rows show the latest reply:** Each conversation's second row shows the last assistant reply (Markdown stripped); a waiting conversation says what it waits for, such as needs your answer or sandbox permission.
+- **`usage status --json` explains missing quotas:** Unavailable agents carry `reason` (`not_signed_in`, `no_data` or `error`). The pane shows Claude and Codex with that reason instead of dropping them; Antigravity and Grok stay hidden like the menu bar unless reading fails.
+
+### Changed
+- **Side pane quota block is easier to scan:** The tightest quota is listed first, each tool takes two rows with its name in a left column, model names are gone, and windows under 50% are gray so only the ones worth watching are colored. Antigravity's Claude / GPT pool is no longer shown in the pane.
+- **Session marks follow state:** A spinner while working, a yellow `?` while waiting for you, a green check for ten minutes after finishing, then a gray dot. The Busy and Idle labels are gone.
+
+## [0.32.1] - 2026-10-05
+
+### Added
+- **Claude Code side pane on Windows:** The system-tray panel menu now has the **Claude Code side pane** switch. The pane runs on Windows without POSIX tools (`tasklist` for live conversations, `findstr` for long transcripts), and `usage.exe status --json` supplies its quota data. Enabling it also turns on Claude Code's fullscreen layout, which the pane needs to dock on the right; turning the pane off switches the layout back.
+
+### Changed
+- **Claude Code side pane follows Hide Sections:** Tools hidden from the usage menu are also hidden in the pane and the compact box above the prompt, on macOS and Windows.
+
+## [0.32.0] - 2026-10-05
+
+### Added
+- **Claude Code side pane (macOS):** Toggle quotas, Claude sessions and background jobs inside Claude Code. Requires a recent Claude Code with mod support (tested with 2.1.289). Open a new conversation or run `/reload-plugins` after enabling. The pane opens on the right automatically at terminal widths ≥144 columns; use `/usage-dash` in narrower terminals. macOS Terminal supports only 256 colors and may show a gray background; select an ANSI dark theme in `/config`. Conversations waiting for your permission or MCP input are marked in yellow across panes, and background jobs also list subagents started by Claude with the Agent tool and their status.
+- **`usage status --json` includes Antigravity and Grok quotas.** Read all Antigravity groups from the local cache and Grok billing from its local log, with reset countdowns and snapshot ages. The text summary stays unchanged.
+
+### Fixed
+- **Claude Code side pane:** when the usage app starts, an enabled pane is automatically updated to the bundled version, so upgrades no longer require toggling it off and on.
+- **Claude Code side pane:** the refresh age switches from seconds to minutes or hours after one minute.
+- **Claude Code side pane:** quota windows with missing data are hidden instead of appearing as 0%.
+
+## [0.31.6] - 2026-10-04
+
+### Fixed
+- **Windows:** the tray menu's "Quit" item no longer shows a missing-glyph box.
+- **Windows:** the Grok status line in the classic console no longer overwrites the quota percentage.
+
+## [0.31.5] - 2026-10-03
+
+### Changed
+- **The status line is shorter.** The first line now holds only the project and your two quotas; the context window moved to the end of the second line. The cache segment lost its bar and its countdown and shows just the hit rate (for example `Cache: 93%`) — the countdown read about 59 minutes almost every time, because Claude Code restarts it on every message and the status line does not redraw while you are idle.
+- The two quotas now show the reset clock time before the time remaining (for example `22:00 (3h45m left)`), and both are drawn in a dimmer colour.
+
+### Removed
+- The "cold cache, next message re-caches N tokens" text added in 0.31.4 is gone from the status line.
+
+### Fixed
+- Add `gpt-6.1-sol` to the offline fallback price table, so its Codex usage is no longer priced at $0 when the downloaded price table is stale.
+
 ## [0.31.4] - 2026-09-29
 
 ### Added

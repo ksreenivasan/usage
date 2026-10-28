@@ -16,6 +16,7 @@ import logging
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 from typing import Any, NotRequired, TypedDict, cast
 
@@ -24,10 +25,10 @@ from analyzer import persona_loader
 from analyzer import subscription
 from adapters import agy, claude, codex, grok, muse
 from adapters.types import AgentInfo, UsageEntry
-from pricing import calculate_cost, is_model_priced
+from usage_common.pricing import calculate_cost, is_model_priced
 
 from .aggregator import aggregate_sessions
-from . import diagnoser, dispatch_ledger, usage_snapshot
+from . import diagnoser, dispatch_ledger, ledger_backfill, usage_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -43,8 +44,9 @@ _YEAR_WEEKS = 53
 YEAR_CACHE_PATH = Path(os.path.expanduser("~/.usage/year_cache.json"))
 YEAR_LEDGER_PATH = YEAR_CACHE_PATH.with_name("year_ledger.json")
 YEAR_CACHE_TTL_SECONDS = 6 * 3600
-_YEAR_CACHE_SCHEMA = 5
+_YEAR_CACHE_SCHEMA = 6
 _YEAR_LEDGER_SCHEMA = 1
+_year_ledger_lock = threading.Lock()
 _YEAR_LEDGER_TRIM_BUFFER_DAYS = 60
 
 
@@ -200,6 +202,7 @@ class ContributionReportData(TypedDict):
 
 
 class WrappedReportData(TypedDict):
+    cost_recorded_from: NotRequired[str | None]
     year_label: str
     weeks: int
     total_tokens: int
@@ -315,6 +318,18 @@ def _load_agent_entries(
     for entry in entries:
         entry.agent_id = agent.id
     return entries
+
+
+def load_history_entries(
+    agents: list[AgentInfo], date_from: date, date_to: date
+) -> list[UsageEntry]:
+    hours_back = ((date_to - date_from).days + 2) * 24
+    return [
+        entry
+        for agent in agents
+        for entry in _load_agent_entries(agent, hours_back)
+        if date_from <= _entry_date(entry) <= date_to and not ledger_backfill.is_ledger_entry(entry)
+    ]
 
 
 def _load_recent_claude_entries(hours_back: int) -> list[UsageEntry]:
@@ -662,18 +677,21 @@ def _merge_year_ledger(
     *,
     trim_before: date,
 ) -> _YearLedger:
-    ledger = _read_year_ledger()
-    days = ledger["days"]
-    for day_key, current_day in current_days.items():
-        ledger_day = days.get(day_key)
-        if ledger_day is None or current_day["total_tokens"] >= ledger_day["total_tokens"]:
-            days[day_key] = current_day
+    with _year_ledger_lock:
+        ledger = _read_year_ledger()
+        days = ledger["days"]
+        for day_key, current_day in current_days.items():
+            ledger_day = days.get(day_key)
+            if ledger_day is None or current_day["total_tokens"] >= ledger_day["total_tokens"]:
+                days[day_key] = current_day
 
-    ledger["days"] = {
-        day_key: day for day_key, day in days.items() if date.fromisoformat(day_key) >= trim_before
-    }
-    _write_year_ledger(ledger)
-    return ledger
+        ledger["days"] = {
+            day_key: day
+            for day_key, day in days.items()
+            if date.fromisoformat(day_key) >= trim_before
+        }
+        _write_year_ledger(ledger)
+        return ledger
 
 
 def _build_year_output_from_ledger(
@@ -753,8 +771,16 @@ def _build_year_output_from_ledger(
         "busiest_day": busiest_day,
     }
     wrapped: WrappedReportData = {
+        "cost_recorded_from": min(
+            (
+                key
+                for key, day in ledger["days"].items()
+                if grid_start <= date.fromisoformat(key) <= today and day["cost"] > 0
+            ),
+            default=None,
+        ),
         "year_label": str(today.year),
-        "weeks": _YEAR_WEEKS,
+        "weeks": len(weeks),
         "total_tokens": total_tokens,
         "total_cost": _round_cost(total_cost),
         "active_days": active_days,
@@ -795,6 +821,15 @@ def build_year_data(agents: list[AgentInfo]) -> YearReportData:
         grid_start=grid_start,
         grid_end=grid_end,
         today=today,
+    )
+
+
+def persist_year_entries(entries: list[UsageEntry], today: date) -> _YearLedger:
+    grid_end = today + timedelta(days=(5 - today.weekday()) % 7)
+    grid_start = grid_end - timedelta(days=_YEAR_WEEKS * 7 - 1)
+    return _merge_year_ledger(
+        _aggregate_year_days(entries),
+        trim_before=grid_start - timedelta(days=_YEAR_LEDGER_TRIM_BUFFER_DAYS),
     )
 
 
@@ -923,10 +958,21 @@ def build_report_data(agents: list[AgentInfo], period: str = "month") -> ReportD
         raw_entries.extend(_load_agent_entries(agent, hours_back))
     entry_dates = {id(entry): _entry_date(entry) for entry in raw_entries}
 
+    ledger_days = _read_year_ledger()["days"]
     if date_from is None:
         earliest_live = min(entry_dates.values()) if entry_dates else None
         earliest_snap = usage_snapshot.earliest_date()
-        earliest_candidates = [day for day in (earliest_live, earliest_snap) if day is not None]
+        earliest_ledger = min(
+            (
+                date.fromisoformat(day)
+                for day, value in ledger_days.items()
+                if any(tokens > 0 for tokens in value["agent_tokens"].values())
+            ),
+            default=None,
+        )
+        earliest_candidates = [
+            day for day in (earliest_live, earliest_snap, earliest_ledger) if day is not None
+        ]
         date_from = min(earliest_candidates) if earliest_candidates else date_to
 
     span_from = date_from
@@ -940,12 +986,16 @@ def build_report_data(agents: list[AgentInfo], period: str = "month") -> ReportD
     raw_entries, entry_dates = usage_snapshot.merge_live_with_snapshot(
         raw_entries, entry_dates, span_from, span_to
     )
+    raw_entries, entry_dates = ledger_backfill.merge_with_ledger(
+        raw_entries, entry_dates, ledger_days, span_from, span_to
+    )
 
     entries = [entry for entry in raw_entries if date_from <= entry_dates[id(entry)] <= date_to]
 
+    real_entries = [entry for entry in entries if not ledger_backfill.is_ledger_entry(entry)]
     total_tokens = sum(entry.total_tokens for entry in entries)
     total_cost = 0.0
-    session_ids = {entry.session_id for entry in entries}
+    session_ids = {entry.session_id for entry in real_entries}
     active_dates = {entry_dates[id(entry)] for entry in entries}
     total_days = (date_to - date_from).days + 1
     comparison = _build_comparison(raw_entries, entry_dates, period, date_from, date_to)
@@ -974,7 +1024,7 @@ def build_report_data(agents: list[AgentInfo], period: str = "month") -> ReportD
         lambda: defaultdict(lambda: defaultdict(int))
     )
     daily_totals: dict[date, dict[str, Any]] = defaultdict(lambda: {"tokens": 0, "cost": 0.0})
-    cube_totals: dict[tuple[date, str, str, str], dict[str, int | float]] = defaultdict(
+    cube_totals: dict[tuple[date, str, str, str, bool], dict[str, int | float]] = defaultdict(
         lambda: {
             "input_tokens": 0,
             "output_tokens": 0,
@@ -990,18 +1040,20 @@ def build_report_data(agents: list[AgentInfo], period: str = "month") -> ReportD
         total_cost += cost
         agent_totals = by_agent_totals[entry.agent_id or "unknown"]
         agent_totals["tokens"] += entry.total_tokens
-        agent_totals["input_tokens"] += entry.input_tokens
-        agent_totals["output_tokens"] += entry.output_tokens
-        agent_totals["cache_creation_tokens"] += entry.cache_creation_tokens
-        agent_totals["cache_read_tokens"] += entry.cache_read_tokens
+        if not ledger_backfill.is_ledger_entry(entry):
+            agent_totals["input_tokens"] += entry.input_tokens
+            agent_totals["output_tokens"] += entry.output_tokens
+            agent_totals["cache_creation_tokens"] += entry.cache_creation_tokens
+            agent_totals["cache_read_tokens"] += entry.cache_read_tokens
+            agent_totals["sessions"].add(entry.session_id)
         agent_totals["cost"] += cost
-        agent_totals["sessions"].add(entry.session_id)
         agent_totals["messages"] += entry.message_count
 
         project = by_project_totals[entry.project or "unknown"]
         project["tokens"] += entry.total_tokens
         project["cost"] += cost
-        project["sessions"].add(entry.session_id)
+        if not ledger_backfill.is_ledger_entry(entry):
+            project["sessions"].add(entry.session_id)
 
         model = by_model_totals[entry.model or "unknown"]
         model["tokens"] += entry.total_tokens
@@ -1026,6 +1078,7 @@ def build_report_data(agents: list[AgentInfo], period: str = "month") -> ReportD
                 entry.agent_id or "unknown",
                 entry.model or "unknown",
                 entry.project or "unknown",
+                ledger_backfill.is_ledger_entry(entry),
             )
         ]
         cube_row["input_tokens"] += entry.input_tokens
@@ -1118,6 +1171,7 @@ def build_report_data(agents: list[AgentInfo], period: str = "month") -> ReportD
         cube_agent_id,
         cube_model_name,
         cube_project_name,
+        _cube_is_ledger,
     ), values in cube_totals.items():
         row_tokens = (
             int(values["input_tokens"])
@@ -1162,6 +1216,7 @@ def build_report_data(agents: list[AgentInfo], period: str = "month") -> ReportD
         cube_agent_id,
         cube_model_name,
         cube_project_name,
+        cube_is_ledger,
     ), values in cube_totals.items():
         cube_rows.append(
             [
@@ -1175,6 +1230,8 @@ def build_report_data(agents: list[AgentInfo], period: str = "month") -> ReportD
                 int(values["cache_read_tokens"]),
                 _round_cost(float(values["cost"])),
                 int(values["message_count"]),
+                # Optional index 10 marks ledger totals; legacy real rows stay unchanged.
+                *([1] if cube_is_ledger else []),
             ]
         )
     cube_rows.sort(key=lambda row: (row[0], row[1], row[2], row[3]))
@@ -1202,10 +1259,19 @@ def build_report_data(agents: list[AgentInfo], period: str = "month") -> ReportD
     top_sessions: list[TopSessionReportRow] = []
     now = datetime.now().astimezone(timezone.utc)
     weekly_entries = raw_entries if weekly_preloaded is None else weekly_preloaded
+    weekly_entries = [
+        entry for entry in weekly_entries if not ledger_backfill.is_ledger_entry(entry)
+    ]
     windows = dispatch_ledger.load_windows() if weekly_entries else {}
-    estimates = dispatch_ledger.estimate_sessions(weekly_entries, windows, now)
+    group_estimates, reset_sessions = dispatch_ledger.estimate_sessions(
+        weekly_entries, windows, now
+    )
+    estimates: dict[tuple[str, str], float] = {}
+    for (agent_id, session_id, _), value in group_estimates.items():
+        key = (agent_id, session_id)
+        estimates[key] = estimates.get(key, 0.0) + value
     sessions_by_cost = sorted(
-        aggregate_sessions(entries), key=lambda session: session.cost_usd, reverse=True
+        aggregate_sessions(real_entries), key=lambda session: session.cost_usd, reverse=True
     )
     sessions_by_tokens = sorted(
         sessions_by_cost, key=lambda session: session.total_tokens, reverse=True
@@ -1238,7 +1304,7 @@ def build_report_data(agents: list[AgentInfo], period: str = "month") -> ReportD
         )
 
     year_data = _load_year_data_cached(agents)
-    usage_snapshot.record_entries(entries, entry_dates=entry_dates)
+    usage_snapshot.record_entries(real_entries, entry_dates=entry_dates)
 
     return {
         "period": period,
@@ -1247,10 +1313,10 @@ def build_report_data(agents: list[AgentInfo], period: str = "month") -> ReportD
         "date_to": date_to.isoformat(),
         "summary": {
             "total_tokens": total_tokens,
-            "input_tokens": sum(entry.input_tokens for entry in entries),
-            "output_tokens": sum(entry.output_tokens for entry in entries),
-            "cache_creation_tokens": sum(entry.cache_creation_tokens for entry in entries),
-            "cache_read_tokens": sum(entry.cache_read_tokens for entry in entries),
+            "input_tokens": sum(entry.input_tokens for entry in real_entries),
+            "output_tokens": sum(entry.output_tokens for entry in real_entries),
+            "cache_creation_tokens": sum(entry.cache_creation_tokens for entry in real_entries),
+            "cache_read_tokens": sum(entry.cache_read_tokens for entry in real_entries),
             "cost_usd": _round_cost(total_cost),
             "sessions": len(session_ids),
             # by_project 只留前 10 名，敘述句要報真實專案數就得另外帶
@@ -1267,7 +1333,12 @@ def build_report_data(agents: list[AgentInfo], period: str = "month") -> ReportD
         "sessions": session_rows,
         "daily_trend": daily_trend,
         "top_sessions": top_sessions,
-        "dispatch_ledger": dispatch_ledger.build_ledger(estimates, now),
+        "dispatch_ledger": dispatch_ledger.build_ledger(
+            group_estimates,
+            now,
+            reset_sessions,
+            {key: window.used_pct for key, window in windows.items()},
+        ),
         "comparison": comparison,
         "subscriptions": subscription.load_subscriptions(),
         "persona": _load_persona_for_period(period),

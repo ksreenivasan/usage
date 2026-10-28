@@ -11,8 +11,10 @@ from functools import cache, lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from usage_common.i18n import _load_i18n_bundle
+
 if TYPE_CHECKING:
-    from menubar.state import PopoverState, QuotaRowState
+    from menubar.state import PeriodTotal, PopoverState, QuotaRowState
 
 CORE_SCRIPT_FILENAME = "panels/panel_core.js"
 
@@ -29,20 +31,6 @@ def resolve_resource(name: str) -> str:
         if bundled.exists():
             return str(bundled)
     return str(Path(__file__).resolve().parent.parent / "assets" / name)
-
-
-def _i18n_path() -> Path:
-    resource_root = os.environ.get("RESOURCEPATH")
-    if resource_root:
-        bundled = Path(resource_root) / "i18n.json"
-        if bundled.exists():
-            return bundled
-    frozen_root = getattr(sys, "_MEIPASS", None)
-    if frozen_root:
-        bundled = Path(frozen_root) / "i18n.json"
-        if bundled.exists():
-            return bundled
-    return Path(__file__).resolve().parent.parent / "i18n.json"
 
 
 def _new_state_payload(view: Any, payload: dict[str, object]) -> str | None:
@@ -72,15 +60,6 @@ def _load_core_script() -> str:
     return Path(resolve_resource(CORE_SCRIPT_FILENAME)).read_text(encoding="utf-8")
 
 
-@lru_cache(maxsize=1)
-def _load_i18n_bundle() -> dict[str, dict[str, str]]:
-    data = json.loads(_i18n_path().read_text(encoding="utf-8"))
-    return {
-        str(lang): {str(key): str(value) for key, value in values.items()}
-        for lang, values in data.items()
-    }
-
-
 @lru_cache(maxsize=4)
 def _data_uri(asset_name: str) -> str:
     path = Path(resolve_resource(asset_name))
@@ -90,9 +69,17 @@ def _data_uri(asset_name: str) -> str:
 
 
 def _row_payload(row: QuotaRowState) -> dict[str, object]:
+    from menubar.state import _format_percent
+
+    percent = row.display_percent
     return {
-        "percent": row.percent,
+        "percent": row.display_percent,
         "percentText": row.percent_text,
+        "percentTextCompact": (
+            f"{_format_percent(float(percent))}%"
+            if row.available and percent is not None
+            else row.percent_text
+        ),
         "resetText": row.reset_text,
         "resetTextCompact": row.reset_text_compact or row.reset_text,
         "warning": row.warning,
@@ -104,6 +91,8 @@ def _row_payload(row: QuotaRowState) -> dict[str, object]:
 def _state_payload(
     state: PopoverState, *, system_accent_color: str | None = None
 ) -> dict[str, object]:
+    from menubar.agy import quota_group_keys
+
     codex_rows = {
         key: _row_payload(row)
         for key, row in (("session", state.codex_session), ("weekly", state.codex_weekly))
@@ -143,11 +132,19 @@ def _state_payload(
             "session": _row_payload(state.agy_session),
             "weekly": _row_payload(state.agy_weekly),
             "groupName": state.agy_group_name,
+            "groupSwitchable": state.agy_group_switchable,
+            "availableGroups": quota_group_keys(),
+            "weeklyOnly": state.agy_weekly_only,
             "stale": state.agy_stale,
         },
         "grok": {
             "weekly": _row_payload(state.grok_weekly),
             "stale": state.grok_stale,
+        },
+        "muse": {
+            "session": _row_payload(state.muse_session),
+            "weekly": _row_payload(state.muse_weekly),
+            "stale": state.muse_stale,
         },
         "projects": project_payloads[0],
         "projectsYesterday": project_payloads[1],
@@ -158,14 +155,14 @@ def _state_payload(
         "hideCodex": state.hide_codex,
         "hideAgy": state.hide_agy,
         "hideGrok": state.hide_grok,
+        "hideMuse": state.hide_muse,
         "cardOrder": list(state.card_order),
         "historyError": state.history_error,
-        "statusline": state.statusline,
         "footer": {
             "rate": state.rate_text,
             "status": state.status_text,
-            "today": state.today_text,
-            "yesterday": state.yesterday_text,
+            "today": _period_payload(state.today_total),
+            "yesterday": _period_payload(state.yesterday_total),
             "serviceAlerts": list(state.service_alerts),
             "showInstall": state.show_install_button,
         },
@@ -181,3 +178,7 @@ def _fmt_tokens(tokens: int) -> str:
 
 def _fmt_cost(cost: float | None) -> str:
     return "--" if cost is None else f"${cost:.2f}"
+
+
+def _period_payload(total: PeriodTotal) -> dict[str, str]:
+    return {"tokensText": _fmt_tokens(total.tokens), "costText": _fmt_cost(total.cost)}

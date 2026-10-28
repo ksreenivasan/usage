@@ -8,7 +8,7 @@
 
 Claude Code calls the command configured in ~/.claude/settings.json statusLine
 and sends session JSON on stdin whenever it refreshes the status line. The
-installer copies usage_statusline.py to ~/.claude/usage-statusline.py and points
+installer copies usage_hooks/usage_statusline.py to ~/.claude/usage-statusline.py and points
 statusLine at it, so the main app can read a local status file.
 
 The previous statusLine is backed up under settings["usage"]["previousStatusLine"]
@@ -34,9 +34,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
-from i18n import t as _t
 from loaders.claude_paths import claude_home
 from loaders.codex_paths import codex_home
+from usage_common.i18n import t as _t
 from usage_common.subprocess_utils import hidden_console_kwargs
 
 HOOK_TARGET = Path(os.path.expanduser("~/.claude/usage-statusline.py"))
@@ -86,7 +86,7 @@ PREV_SL_KEY = "previousStatusLine"
 # Where the status-line switch parks the live statusLine while it is off, so it
 # never overwrites the pre-install backup under PREV_SL_KEY.
 DISABLED_SL_KEY = "disabledStatusLine"
-HOOK_VERSION = "1.7"
+HOOK_VERSION = "1.14"
 FORWARDER_VERSION = "1.1"
 # Antigravity's Go runner hands its status-line command to cmd.exe unquoted, so
 # every character cmd.exe treats specially has to be kept out of the path.
@@ -118,9 +118,9 @@ def configure_windows_utf8_output() -> None:
 
 
 def _resolve_hook_source() -> Path:
-    # installer/ is one level below the repo root, where the hook scripts remain.
+    # installer/ is one level below the repo root; hook sources live in usage_hooks/.
     paths = [
-        Path(__file__).resolve().parent.parent / "usage_statusline.py",
+        Path(__file__).resolve().parent.parent / "usage_hooks" / "usage_statusline.py",
         Path(sys.executable).resolve().parent.parent / "Resources" / "usage_statusline.py",
     ]
     for path in paths:
@@ -132,7 +132,7 @@ def _resolve_hook_source() -> Path:
 
 def _resolve_forwarder_source() -> Path:
     paths = [
-        Path(__file__).resolve().parent.parent / "usage_statusline_forwarder.py",
+        Path(__file__).resolve().parent.parent / "usage_hooks" / "usage_statusline_forwarder.py",
         (
             Path(sys.executable).resolve().parent.parent
             / "Resources"
@@ -148,7 +148,7 @@ def _resolve_forwarder_source() -> Path:
 
 def _resolve_agy_hook_source() -> Path | None:
     paths = [
-        Path(__file__).resolve().parent.parent / "usage_statusline_agy.py",
+        Path(__file__).resolve().parent.parent / "usage_hooks" / "usage_statusline_agy.py",
         Path(sys.executable).resolve().parent.parent / "Resources" / "usage_statusline_agy.py",
     ]
     return next((path for path in paths if path.exists()), None)
@@ -166,7 +166,7 @@ def _agy_hook_script_is_stale() -> bool:
 
 def _resolve_grok_hook_source() -> Path | None:
     paths = [
-        Path(__file__).resolve().parent.parent / "usage_statusline_grok.py",
+        Path(__file__).resolve().parent.parent / "usage_hooks" / "usage_statusline_grok.py",
         Path(sys.executable).resolve().parent.parent / "Resources" / "usage_statusline_grok.py",
     ]
     return next((path for path in paths if path.exists()), None)
@@ -1080,10 +1080,6 @@ def _ensure_table_line(content: str, name: str, line_regex: re.Pattern[str], lin
     return content[:start] + f"\n{line}" + content[start:]
 
 
-def _find_tui_table(content: str) -> re.Match[str] | None:
-    return _find_table(content, "tui")
-
-
 def _insert_tui_status_line(content: str, replacement: str) -> str:
     return _insert_table_line(content, "tui", replacement)
 
@@ -1277,7 +1273,7 @@ def is_codex_setup() -> bool:
 
 
 def _install_forwarder(settings: dict[str, Any]) -> None:
-    """Copy usage_statusline_forwarder.py to ~/.claude/ and update settings.json."""
+    """Copy usage_hooks/usage_statusline_forwarder.py to ~/.claude/ and update settings.json."""
     _copy_hook_script()
     _copy_forwarder_script()
     _backup_existing_statusline(settings)

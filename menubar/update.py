@@ -10,34 +10,35 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+import time
+import webbrowser
 from typing import Any, Protocol
 
-import usage_diagnosis_snapshot
-from menubar.prefs import _auto_update_check_enabled
-from prefs import _load_preferences, _save_preferences
+from analyzer import diagnosis_snapshot, history_persist
+from installer import claude_pane
 from updates import checker as update_checker
 from updates import gate as update_gate
+from updates.release_notes import alert_release_notes
+from usage_common.app_version import current_version as _current_version
+from usage_common.i18n import _t
+from usage_common.prefs import _load_preferences, _save_preferences
 
 logger = logging.getLogger(__name__)
 
 
 class _UpdateApp(Protocol):
+    language: str
+    _auto_check_schedule: update_gate.AutoCheckSchedule
+
     def performSelectorOnMainThread_withObject_waitUntilDone_(
         self, selector: str, obj: Any, wait: bool
     ) -> None: ...
 
-    def _check_update_in_background(
-        self,
-        *,
-        manual: bool,
-        ignore_cooldown: bool,
-        ignore_skipped: bool,
-    ) -> None: ...
+    def _check_update_in_background(self) -> bool: ...
 
 
 def clear_stale_update_cache() -> None:
-    from menubar.app import _current_version
-
     try:
         current_version = _current_version()
         prefs = _load_preferences()
@@ -50,32 +51,37 @@ def clear_stale_update_cache() -> None:
 
 
 def maybe_check_update_in_background(app: _UpdateApp) -> None:
-    usage_diagnosis_snapshot.maybe_schedule_refresh()
-    app._check_update_in_background(
-        manual=False,
-        ignore_cooldown=False,
-        ignore_skipped=False,
-    )
+    diagnosis_snapshot.maybe_schedule_refresh()
+    history_persist.maybe_schedule_refresh()
+    try:
+        claude_pane.refresh_claude_pane()
+    except (OSError, SystemExit):
+        logger.warning("Claude Code pane refresh failed", exc_info=True)
+    if app._auto_check_schedule.try_begin(time.time()):
+        _run_auto_check(app)
 
 
-def check_update_in_background(
-    app: _UpdateApp,
-    *,
-    manual: bool,
-    ignore_cooldown: bool,
-    ignore_skipped: bool,
-) -> None:
-    from menubar.app import _current_version
+def _run_auto_check(app: _UpdateApp) -> None:
+    failed = True
+    try:
+        failed = bool(app._check_update_in_background())
+    finally:
+        app._auto_check_schedule.finish(time.time(), failed=failed)
 
+
+def on_poll_tick(app: _UpdateApp) -> None:
+    clear_stale_update_cache()
+    if app._auto_check_schedule.try_begin(time.time()):
+        threading.Thread(target=_run_auto_check, args=(app,), daemon=True).start()
+
+
+def check_update_in_background(app: _UpdateApp) -> bool:
     prefs = _load_preferences()
-    if not manual and not _auto_update_check_enabled(prefs):
-        return
+    if not update_gate.auto_check_is_due(prefs):
+        return False
 
-    if not manual and not update_gate.auto_check_is_due(prefs):
-        return
-
-    if not ignore_cooldown and update_gate.dismissed_recently(prefs):
-        return
+    if update_gate.dismissed_recently(prefs):
+        return False
 
     try:
         current_version = _current_version()
@@ -83,22 +89,10 @@ def check_update_in_background(
     except Exception:
         if os.environ.get("USAGE_DEBUG") == "1":
             logger.warning("update check failed", exc_info=True)
-        if manual:
-            app.performSelectorOnMainThread_withObject_waitUntilDone_(
-                "_showUpdateCheckFailed:",
-                None,
-                False,
-            )
-        return
+        return True
 
     if check_result.failed:
-        if manual:
-            app.performSelectorOnMainThread_withObject_waitUntilDone_(
-                "_showUpdateCheckFailed:",
-                None,
-                False,
-            )
-        return
+        return True
 
     release = check_result.release
     # Re-read: the network check can take seconds, and a toggle saved meanwhile must survive.
@@ -107,19 +101,37 @@ def check_update_in_background(
     _save_preferences(prefs)
 
     if release is None:
-        if manual:
-            app.performSelectorOnMainThread_withObject_waitUntilDone_(
-                "_showNoUpdateAvailable:",
-                None,
-                False,
-            )
-        return
+        return False
 
-    if not ignore_skipped and prefs.get("update_skipped_version") == release.version:
-        return
+    if prefs.get("update_skipped_version") == release.version:
+        return False
 
     app.performSelectorOnMainThread_withObject_waitUntilDone_(
         "_showUpdateAlert:",
         release,
         False,
     )
+    return False
+
+
+def show_update_alert(app: _UpdateApp, release: update_checker.ReleaseInfo, alert: Any) -> None:
+    from menubar.app import UPDATE_ALERT_BODY_LIMIT
+
+    alert.setMessageText_(_t(app.language, "update_alert_title", version=release.version))
+    alert.setInformativeText_(
+        alert_release_notes(release.body, app.language, UPDATE_ALERT_BODY_LIMIT)
+    )
+    alert.addButtonWithTitle_(_t(app.language, "update_btn_download"))
+    alert.addButtonWithTitle_(_t(app.language, "update_btn_later"))
+    alert.addButtonWithTitle_(_t(app.language, "update_btn_skip"))
+    result = int(alert.runModal())
+    action, pref_updates = update_gate.resolve_alert_choice(result, release.version)
+    if action == "open":
+        webbrowser.open(release.html_url)
+        return
+
+    prefs = _load_preferences()
+    prefs.update(pref_updates)
+    if action == "dismiss":
+        prefs["update_dismissed_at"] = time.time()
+    _save_preferences(prefs)
