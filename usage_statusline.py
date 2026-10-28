@@ -23,6 +23,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import stat
 import sys
 import tempfile
 import time
@@ -82,6 +83,7 @@ _LOCK_CONTENDED_ERRNOS = frozenset(
 PREFERENCES_FILE = os.path.expanduser("~/.claude/usage-preferences.json")
 CONTEXT_BURN_FILE = os.path.expanduser("~/.claude/usage-context-burn.json")
 UPDATE_HINT_STALE_SECONDS = 30 * 86400
+GIT_FILE_MAX_BYTES = 4096
 # Context fill at which a /clear or /compact nudge is worth the noise. Set below
 # the default auto-compact line (~80%) so the user can act before the lossy
 # automatic pass decides for them. Long contexts degrade quality well before they
@@ -570,6 +572,18 @@ def safe_text(value: str) -> str:
     return "".join(ch for ch in value if ch.isprintable())
 
 
+def _read_git_file(path: str) -> str:
+    """Read a small regular file; .git and HEAD come from whatever directory Claude is in.
+
+    A FIFO would hang the render and a symlink to /dev/zero would eat memory, so
+    anything that is not a regular file is refused and reads are capped.
+    """
+    if not stat.S_ISREG(os.stat(path).st_mode):
+        raise OSError(f"not a regular file: {path}")
+    with open(path, encoding="utf-8") as f:
+        return f.read(GIT_FILE_MAX_BYTES)
+
+
 def git_branch(cwd: str) -> str:
     path = os.path.abspath(cwd)
     while True:
@@ -579,15 +593,14 @@ def git_branch(cwd: str) -> str:
             break
         if os.path.isfile(git_path):
             try:
-                with open(git_path, encoding="utf-8") as f:
-                    target = f.read().strip()
+                target = _read_git_file(git_path).strip()
                 if target.startswith("gitdir:"):
                     git_dir = target.split(":", 1)[1].strip()
                     if not os.path.isabs(git_dir):
                         git_dir = os.path.normpath(os.path.join(path, git_dir))
                     head_path = os.path.join(git_dir, "HEAD")
                     break
-            except OSError:
+            except (OSError, UnicodeDecodeError):
                 return ""
         parent = os.path.dirname(path)
         if parent == path:
@@ -595,9 +608,8 @@ def git_branch(cwd: str) -> str:
         path = parent
 
     try:
-        with open(head_path, encoding="utf-8") as f:
-            head = f.read().strip()
-    except OSError:
+        head = _read_git_file(head_path).strip()
+    except (OSError, UnicodeDecodeError):
         return ""
     prefix = "ref: refs/heads/"
     if head.startswith(prefix):
@@ -840,12 +852,8 @@ def _render_core(data: Dict[str, Any], now: datetime) -> str:
     if vlen(SEP.join(line3)) > width and cache_bar_part:
         line3 = [p for p in line3 if p != cache_bar_part]
 
-    update_version = _read_update_hint(now.timestamp())
-    if update_version and (line1 or line3):
-        line3.append(
-            f"{C['cyan']}🆕 v{safe_text(update_version)} "
-            f"{_t('update_available_suffix')}{C['reset']}"
-        )
+    # Fork: no "new version available" hint. It advertised upstream releases;
+    # updates to this fork are reviewed and merged by hand (FORK.md).
 
     output = [SEP.join(line) for line in (line1, line3) if line]
     warning = _heavy_warning(data, now.timestamp())

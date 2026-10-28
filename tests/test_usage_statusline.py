@@ -541,6 +541,71 @@ def test_render_skips_bad_utf8_update_preferences_without_fallback(
     assert "available" not in output
 
 
+def test_render_never_shows_upstream_update_hint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    prefs_file = tmp_path / "usage-preferences.json"
+    _write_prefs(
+        prefs_file,
+        {
+            "last_update_check": {
+                "checked_at": now.timestamp(),
+                "current_version": "0.31.4",
+                "latest_version": "0.34.7",
+            },
+        },
+    )
+    monkeypatch.setattr(usage_statusline, "PREFERENCES_FILE", str(prefs_file))
+    monkeypatch.setenv("TT_LANG", "en")
+    monkeypatch.setattr(usage_statusline, "get_width", lambda: 200)
+
+    output = usage_statusline.render(
+        {
+            "model": {"display_name": "Sonnet 4.6"},
+            "rate_limits": {
+                "five_hour": {"used_percentage": 85},
+                "seven_day": {"used_percentage": 33},
+            },
+        },
+        now,
+    )
+
+    assert "5h" in output
+    assert "0.34.7" not in output
+    assert "available" not in output
+
+
+def test_git_branch_reads_regular_head(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "HEAD").write_text("ref: refs/heads/ks-main\n", encoding="utf-8")
+
+    assert usage_statusline.git_branch(str(tmp_path)) == "ks-main"
+
+
+def test_git_branch_refuses_fifo_head(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+    os.mkfifo(tmp_path / ".git" / "HEAD")
+
+    assert usage_statusline.git_branch(str(tmp_path)) == ""
+
+
+def test_git_branch_refuses_device_head(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "HEAD").symlink_to("/dev/zero")
+
+    assert usage_statusline.git_branch(str(tmp_path)) == ""
+
+
+def test_git_branch_caps_gitdir_file_read(tmp_path: Path) -> None:
+    (tmp_path / ".git").write_text(
+        "gitdir: " + "x" * (usage_statusline.GIT_FILE_MAX_BYTES * 4), encoding="utf-8"
+    )
+
+    assert usage_statusline.git_branch(str(tmp_path)) == ""
+
+
 def test_save_cleans_temp_file_when_atomic_replace_fails(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
