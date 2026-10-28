@@ -710,7 +710,7 @@ def git_branch(cwd: str) -> str:
                         git_dir = os.path.normpath(os.path.join(path, git_dir))
                     head_path = os.path.join(git_dir, "HEAD")
                     break
-            except (OSError, UnicodeDecodeError):
+            except (OSError, ValueError):
                 return ""
         parent = os.path.dirname(path)
         if parent == path:
@@ -719,7 +719,7 @@ def git_branch(cwd: str) -> str:
 
     try:
         head = _read_git_file(head_path).strip()
-    except (OSError, UnicodeDecodeError):
+    except (OSError, ValueError):
         return ""
     prefix = "ref: refs/heads/"
     if head.startswith(prefix):

@@ -599,10 +599,17 @@ def test_git_branch_refuses_device_head(tmp_path: Path) -> None:
     assert usage_statusline.git_branch(str(tmp_path)) == ""
 
 
-def test_git_branch_caps_gitdir_file_read(tmp_path: Path) -> None:
-    (tmp_path / ".git").write_text(
-        "gitdir: " + "x" * (usage_statusline.GIT_FILE_MAX_BYTES * 4), encoding="utf-8"
+def test_git_branch_caps_head_read(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "HEAD").write_text(
+        "ref: refs/heads/" + "x" * (usage_statusline.GIT_FILE_MAX_BYTES * 4), encoding="utf-8"
     )
+
+    assert len(usage_statusline.git_branch(str(tmp_path))) < usage_statusline.GIT_FILE_MAX_BYTES
+
+
+def test_git_branch_ignores_nul_in_gitdir(tmp_path: Path) -> None:
+    (tmp_path / ".git").write_text("gitdir: a\0b\n", encoding="utf-8")
 
     assert usage_statusline.git_branch(str(tmp_path)) == ""
 
