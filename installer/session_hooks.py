@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import logging
 import os
 import re
 import shutil
@@ -59,7 +60,7 @@ CODEX_CONFIG = setup_hook.CODEX_CONFIG
 # session. Off by default: enabled only via the menu toggle, never by self_heal.
 RESUME_HOOK_TARGET = Path(os.path.expanduser("~/.claude/usage-session-resume.py"))
 RESUME_PROMPT_SIDECAR = Path(os.path.expanduser("~/.claude/usage-resume-prompt.json"))
-RESUME_HOOK_VERSION = "1.11"
+RESUME_HOOK_VERSION = "1.13"
 RESUME_MATCHER = "startup|clear|resume"
 RESUME_LANGS = ("zh-TW", "zh-CN", "en", "ja", "ko")
 _RESUME_MARKER = "usage-session-resume"
@@ -94,7 +95,7 @@ _TERSE_REMINDER_MARKER = "usage-terse-reminder"
 _TERSE_REMINDER_MARKERS = (_TERSE_REMINDER_MARKER, "usage_terse_reminder")
 # Independent, opt-in Claude Code UserPromptSubmit hook.
 QUOTA_AWARE_HOOK_TARGET = Path(os.path.expanduser("~/.claude/usage-quota-aware.py"))
-QUOTA_AWARE_HOOK_VERSION = "1.3"
+QUOTA_AWARE_HOOK_VERSION = "1.5"
 QUOTA_AWARE_MATCHER = ""
 _QUOTA_AWARE_MARKER = "usage-quota-aware"
 _QUOTA_AWARE_MARKERS = (_QUOTA_AWARE_MARKER, "usage_quota_aware")
@@ -545,6 +546,11 @@ def _setup_codex_terse() -> None:
         new_content = _ensure_table_line(content, "features", _FEATURES_HOOKS_REGEX, "hooks = true")
         if new_content != content:
             _atomic_write_text(CODEX_CONFIG, new_content)
+        else:
+            logging.getLogger(__name__).warning(
+                "Could not enable Codex hooks in %s: config update failed TOML validation",
+                CODEX_CONFIG,
+            )
 
     hooks = data.get("hooks")
     if not isinstance(hooks, dict):
@@ -616,7 +622,9 @@ def _self_heal_codex_terse() -> None:
     script_missing = not CODEX_TERSE_HOOK_TARGET.exists()
     entry_missing = not _is_codex_terse_installed()
     old_version = _installed_codex_terse_version()
-    version_stale = CODEX_TERSE_HOOK_TARGET.exists() and old_version != TERSE_HOOK_VERSION
+    version_stale = CODEX_TERSE_HOOK_TARGET.exists() and setup_hook.is_older(
+        old_version, TERSE_HOOK_VERSION
+    )
 
     if not (script_missing or entry_missing or version_stale or not hooks_enabled):
         return
@@ -853,7 +861,7 @@ def _self_heal_resume() -> None:
         _copy_resume_script()
         _write_resume_sidecar()
         _append_self_heal_log("restore_resume_hook", detail)
-    elif _installed_resume_version() != RESUME_HOOK_VERSION:
+    elif setup_hook.is_older(_installed_resume_version(), RESUME_HOOK_VERSION):
         old = _installed_resume_version()
         _copy_resume_script()
         _write_resume_sidecar()
@@ -890,7 +898,7 @@ def _self_heal_terse_mode() -> None:
         _append_self_heal_log("restore_terse_hook", f"missing={','.join(missing)}")
     else:
         old = _installed_terse_version()
-        if old != TERSE_HOOK_VERSION:
+        if setup_hook.is_older(old, TERSE_HOOK_VERSION):
             _copy_terse_script()
             _write_terse_sidecar()
             _append_self_heal_log(
@@ -920,7 +928,7 @@ def _self_heal_terse_reminder() -> None:
         _append_self_heal_log("restore_terse_reminder_hook", f"missing={','.join(parts)}")
         return
     old = _installed_terse_reminder_version()
-    if old != TERSE_REMINDER_HOOK_VERSION:
+    if setup_hook.is_older(old, TERSE_REMINDER_HOOK_VERSION):
         _copy_terse_reminder_script()
         _append_self_heal_log(
             "update_terse_reminder_hook",
@@ -1143,8 +1151,8 @@ def _debug_self_heal_failure(action: str, exc: BaseException) -> None:
         print(f"usage self-heal {action} failed: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
-def self_heal() -> None:
-    """Best-effort startup repair for usage-owned Claude statusLine hooks."""
+def _self_heal_statuslines() -> None:
+    """Best-effort startup repair for usage-owned status lines."""
     try:
         settings = _load_settings()
         state = _detect_current_state(settings)
@@ -1152,7 +1160,11 @@ def self_heal() -> None:
             return
         _migrate_bundled_python_commands_if_needed(settings)
         setup_hook._migrate_windows_statusline_command_if_needed(settings)
-        if not is_setup() and "statusLine" not in settings:
+        usage_settings = settings.get(BACKUP_KEY)
+        statusline_disabled = (
+            isinstance(usage_settings, dict) and setup_hook.DISABLED_SL_KEY in usage_settings
+        )
+        if not is_setup() and "statusLine" not in settings and not statusline_disabled:
             exit_code = _run_quietly(setup)
             if exit_code == 0:
                 _append_self_heal_log("install_hook", "initial setup")
@@ -1250,6 +1262,11 @@ def self_heal() -> None:
         if isinstance(exc, KeyboardInterrupt):
             raise
         _debug_self_heal_failure("setup_codex", exc)
+
+
+def self_heal() -> None:
+    """Repair status lines and independently repair opt-in session hooks."""
+    _self_heal_statuslines()
 
     try:
         _self_heal_resume()
@@ -1369,7 +1386,7 @@ def _self_heal_quota_aware() -> None:
     if not is_quota_aware_enabled():
         return
     old = _installed_quota_aware_version()
-    if old != QUOTA_AWARE_HOOK_VERSION:
+    if setup_hook.is_older(old, QUOTA_AWARE_HOOK_VERSION):
         _copy_quota_aware_script()
         _append_self_heal_log(
             "update_quota_aware_hook", f"{old or 'unknown'} -> {QUOTA_AWARE_HOOK_VERSION}"

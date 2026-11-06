@@ -10,6 +10,7 @@ import errno
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -226,23 +227,25 @@ def test_exclusive_lock_times_out_when_another_process_holds_it(
     tmp_path: Path,
 ) -> None:
     lock_path = tmp_path / "usage-status.lock"
-    fcntl = vars(usage_statusline).get("fcntl")
-    assert fcntl is not None
-    ready_read, ready_write = os.pipe()
-    # os.fork is POSIX-only; this test is skipped on Windows, but mypy still
-    # type-checks the line there.
-    child_pid = os.fork()  # type: ignore[attr-defined]
-    if child_pid == 0:
-        os.close(ready_read)
-        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        os.write(ready_write, b"1")
-        time.sleep(0.3)
-        os._exit(0)
-
-    os.close(ready_write)
+    # A fresh interpreter holds the lock until we close its stdin. os.fork()
+    # here would warn: pytest's process is already multi-threaded.
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import fcntl, os, sys\n"
+            "fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)\n"
+            "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+            "print('1', flush=True)\n"
+            "sys.stdin.read()\n",
+            str(lock_path),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    )
+    assert holder.stdin is not None and holder.stdout is not None
     try:
-        assert os.read(ready_read, 1) == b"1"
+        assert holder.stdout.readline() == b"1\n"
         monkeypatch.setattr(usage_statusline, "_LOCK_TIMEOUT_S", 0.01)
         lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
@@ -253,8 +256,9 @@ def test_exclusive_lock_times_out_when_another_process_holds_it(
         finally:
             os.close(lock_fd)
     finally:
-        os.close(ready_read)
-        os.waitpid(child_pid, 0)
+        holder.stdin.close()
+        holder.wait(timeout=5)
+        holder.stdout.close()
 
 
 def test_acquire_msvcrt_lock_waits_out_a_contended_lock(
@@ -402,6 +406,66 @@ def test_save_overwrites_existing_rate_limits_when_new_data_is_complete(
     }
     assert data["_received_at"] == now.isoformat()
     assert data["_received_at_ts"] == now.timestamp()
+
+
+@pytest.mark.parametrize(
+    ("reset_offset", "keep_five"),
+    [
+        (-3600, True),  # Just reset: readers still need the expired window.
+        (-18001, False),  # Issue #273: remove after a full cycle, update seven_day.
+        (-18000, False),  # The exact cutoff is no longer retained.
+        (3600, True),  # An unexpired window still fills the gap.
+    ],
+)
+def test_save_merges_rate_limit_windows_one_by_one(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    reset_offset: int,
+    keep_five: bool,
+) -> None:
+    now = datetime(2026, 11, 1, 12, 0, tzinfo=UTC)
+    cached_five_reset = int(now.timestamp()) + reset_offset
+    status_file = tmp_path / "usage-status.json"
+    status_file.write_text(
+        json.dumps(
+            {
+                "rate_limits": {
+                    "five_hour": {"used_percentage": 11, "resets_at": cached_five_reset},
+                    "seven_day": {"used_percentage": 34, "resets_at": 9_999_999_999},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(usage_statusline, "STATUS_FILE", str(status_file))
+    fresh_seven = {"used_percentage": 46, "resets_at": 1_793_660_400}
+
+    usage_statusline.save(
+        {"rate_limits": {"seven_day": fresh_seven}},
+        now,
+    )
+
+    rate_limits = json.loads(status_file.read_text(encoding="utf-8"))["rate_limits"]
+    assert rate_limits["seven_day"] == fresh_seven
+    expected_five = {"used_percentage": 11, "resets_at": cached_five_reset} if keep_five else None
+    assert rate_limits.get("five_hour") == expected_five
+
+
+def test_save_keeps_expired_cached_windows_when_payload_has_no_quota(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    cached = {
+        "five_hour": {"used_percentage": 11, "resets_at": 1_000},
+        "seven_day": {"used_percentage": 34, "resets_at": 1_000},
+    }
+    status_file = tmp_path / "usage-status.json"
+    status_file.write_text(json.dumps({"rate_limits": cached}), encoding="utf-8")
+    monkeypatch.setattr(usage_statusline, "STATUS_FILE", str(status_file))
+
+    usage_statusline.save({"model": {"display_name": "new"}}, datetime(2026, 11, 1, tzinfo=UTC))
+
+    assert json.loads(status_file.read_text(encoding="utf-8"))["rate_limits"] == cached
 
 
 def _write_prefs(path: Path, prefs: dict[str, Any]) -> None:
@@ -1580,3 +1644,53 @@ def test_mix_sweeps_stale_files_when_a_new_session_starts(tmp_path: Path) -> Non
     transcript.write_bytes(_mix_record({"type": "image"}))
     assert usage_statusline.read_mix({"session_id": "one", "transcript_path": str(transcript)})
     assert sorted(p.name for p in mix_dir.iterdir()) == ["fresh.json", "one.json"]
+
+
+@pytest.mark.parametrize("lang", ["zh-TW", "zh-CN", "en"])
+@pytest.mark.parametrize("width", [200, 16, 1])
+@pytest.mark.parametrize("percent", [99, 100, 101])
+@pytest.mark.parametrize("reset", [None, -60, 0, 10500, 274200])
+def test_render_quota_countdown_variants(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    lang: str,
+    width: int,
+    percent: int,
+    reset: int | None,
+) -> None:
+    monkeypatch.setenv("TT_LANG", lang)
+    monkeypatch.setattr(usage_statusline, "get_width", lambda: width)
+    monkeypatch.setattr(usage_statusline, "read_mix", lambda _data: None)
+    monkeypatch.setattr(usage_statusline, "PREFERENCES_FILE", str(tmp_path / "update.json"))
+    monkeypatch.setattr(usage_statusline, "CONTEXT_BURN_FILE", str(tmp_path / "burn.json"))
+    now = datetime(2026, 1, 1, 23, tzinfo=UTC)
+    resets_at = None if reset is None else now.timestamp() + reset
+    payload = {"rate_limits": {"five_hour": {"used_percentage": percent, "resets_at": resets_at}}}
+    colors = usage_statusline.C
+    prefix = f"{colors['blue']}{usage_statusline._t('five_hour')}:{colors['reset']}"
+    suffix = ""
+    remaining = ""
+    clock = ""
+    if reset is not None and reset > 0:
+        remaining = usage_statusline.fmt_duration(reset)
+        remaining = (
+            usage_statusline._t("remaining_prefix") + remaining
+            if lang in ("zh-TW", "zh-CN")
+            else remaining + " " + usage_statusline._t("remaining_prefix")
+        )
+        assert resets_at is not None
+        reset_dt = datetime.fromtimestamp(resets_at)
+        clock = f"{reset_dt:%H:%M}"
+        if reset_dt.date() != datetime.fromtimestamp(now.timestamp()).date():
+            clock = f"{reset_dt.month}/{reset_dt.day} {clock}"
+        suffix = f" {colors['dim']}{clock}({remaining}){colors['reset']}"
+    if percent >= 100 and remaining:
+        content = f"{clock}({remaining})" if width == 200 else remaining
+        expected = f"{prefix}{colors['red']}{content}{colors['reset']}"
+    else:
+        displayed_percent = 0 if reset is not None and reset <= 0 else percent
+        bar = usage_statusline.progress_bar(displayed_percent, 8 if width >= 100 else 4)
+        expected = prefix + (f"{displayed_percent}%" if width == 1 else bar)
+        if width == 200:
+            expected += suffix
+    assert usage_statusline._render_core(payload, now) == expected

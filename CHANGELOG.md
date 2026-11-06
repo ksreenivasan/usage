@@ -5,6 +5,87 @@
 All notable changes to usage are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+## [0.34.13] - 2026-11-06
+
+### Added
+- **Choose quota-alert thresholds from the menu.** "Usage Alert Notifications" is now a submenu on macOS and in the Windows tray: an on/off switch plus 50/70/80/90/95% checkmarks. A threshold added below current usage waits for the next real crossing instead of firing at once.
+- **The menu tells you when macOS notification permission is off.** An item opens Notification settings, so alerts that would never arrive no longer look enabled.
+
+### Changed
+- **The classic panel is cleaner.** Card titles and project numbers are quieter so percentages and red alerts stand out, the color bar on the left of each card is gone, and the compact layout (four or more quota cards) also tightens the projects card and footer.
+- **Codex's "updated … ago" label is no longer a warning.** Codex has no live report, so an older reading is normal; every panel theme and the Claude Code side pane now show it in muted text without ⚠. Antigravity keeps its warning, since an old value there means a fetch failed.
+- **"Session" reads "5 hours" in Traditional Chinese, Simplified Chinese, Japanese and Korean.**
+- **Beginner mode stops hinting words you type yourself.** If a term such as PR or commit appears in your own message, it no longer comes back as a hint. Asking what a word means ("launchd 是什麼") does not count, and marking the term as not understood in the history pane brings it back.
+
+### Fixed
+- **After switching Claude accounts with `/login`, the quota reminder no longer reports the previous account's quota as yours.** A new session reuses the last known numbers until its first reply; the status line hook now records which session observed them, and the quota reminder ignores numbers from another session.
+- **The quota reminder no longer repeats the same Antigravity warning in one conversation.** Antigravity's reset time drifts by up to a minute between readings, which looked like a new quota window.
+- **An older copy of usage no longer downgrades the hooks a newer one installed.** Self-repair used to reinstall any hook whose version differed, so two copies could keep swapping it; it now only upgrades.
+- **The Muse quota card no longer spends a model call on every refresh.** With Muse 1.4.13 or later, usage reads the allowance from `muse usage --json`, which runs no model. Older Muse versions, or a window with no reading yet, still fall back to the one-line `muse exec` check.
+- **Session handoffs only list commits and edits that succeeded.** A commit rejected by a pre-commit hook or a failed edit no longer shows as done, and `!` shell commands are no longer listed as your last request.
+- **Status-line and launch-at-login switches no longer fail silently.** The status-line switch is on only for usage's own hook, a failed install says so, and a refused launch-at-login registration shows the reason.
+- **Session hooks are repaired even when another tool owns the Claude status line.** The quota reminder also says when a tool's numbers are an hour or more old and the window may have reset.
+- **Quitting the app stops a hung `muse usage` check.**
+
+## [0.34.12] - 2026-11-04
+
+### Fixed
+- **The quota keepers and the Antigravity and Muse quota checks now find CLIs installed with nvm, Volta, fnm, mise, asdf, bun or pnpm.** The menu bar app starts with a short PATH, so these installs used to look missing, and npm-installed tools could not find `node`.
+- **Turning off the status line from the menu now stays off after a restart.** The app used to turn it back on at the next launch. Uninstalling also restores your own status line if you had turned it off, instead of deleting it.
+- **A broken `~/.claude/settings.json` no longer stops the menu bar app from starting.** The app skips the setup prompt and keeps showing usage for every tool.
+- **Uninstalling removes everything usage added to Claude Code.** `usage unsetup` and `--unsetup` now also turn off the quota reminder hook, the side panel and beginner mode; your own hooks and settings stay.
+- **Antigravity usage updates while a conversation is still running.** New usage written to the database's journal file used to wait until the conversation ended.
+- **A custom Claude Code data folder (`CLAUDE_CONFIG_DIR`) refreshes as fast as the default one.** Changes there could take up to 15 minutes to appear.
+- **The Codex reset time no longer keeps moving.** When Codex reports only "resets in N seconds", the countdown now starts from when that message was logged, not from each refresh.
+- **The terminal report shows local times.** Reset times and session start times were shown in UTC, and daily averages near midnight used the UTC date. Tables whose records all have zero tokens no longer crash, the per-minute rate in the blocks view no longer counts cache reads (matching the menu bar), and `usage sessions --sort sessions` falls back to the default order instead of crashing.
+- **The HTML report's Today, Last 7 days, Last 30 days and This month count from the day the report was made.** They used to count from the last day with usage, so Today could show a day from last week. The report also opens after you change time zones, or when a transcript has a timestamp without a time zone.
+- **The menu bar icons follow the top three tools even when their percentages are equal.** On daylight saving days, the Today project ranking also counts the first hour correctly.
+- **Codex setup no longer edits text inside your `config.toml` instructions.** If a multi-line instruction contains a line such as `[tui]`, setup leaves the file unchanged and asks you to adjust `status_line` by hand.
+- **The curl install script and the LaunchAgent script work again.** The install script downloaded the hook from a folder that no longer exists, and the LaunchAgent script failed on accounts without `~/Library/LaunchAgents`.
+
+## [0.34.11] - 2026-11-04
+
+### Changed
+- **Report charts now state their conclusion.** Each section title says what the data shows, such as "Claude Code leads with 66% of tokens", with a subtitle and source line under the chart. Tools, projects and cache hit rate become thin bars on a 0-100% axis, token composition is one stacked bar, and the weekly list becomes a column chart that marks the busiest and latest complete weeks.
+- **The report opens faster on heavy history.** The usage-habits section keeps its profile for an hour instead of five minutes, so most report opens skip rescanning every session file. Usage numbers and charts stay live.
+
+### Fixed
+- **The menu bar shows the Antigravity recovery countdown again.** When quota is used up, it shows the time left until recovery and keeps refreshing at the short polling interval.
+- **Auto-open the next Claude window works again.** Since 0.34.10, Claude Code stops reporting the 5-hour window once it expires, so the keeper never saw it expire and never opened the next one. It now remembers the last reset time it saw and opens the next window after it passes. Plans without a 5-hour limit are unaffected.
+- **Reset Claude quota rows and recovery notifications work again.** Since 0.34.10, the 5-hour and weekly rows showed `--` after a reset, and quota-restored notifications waited until the next Claude reply. The hook now keeps each expired window for one full cycle so readers show 0% and the reset message, and recovery notifications arrive at reset. Plans without a 5-hour limit still drop that window after a full cycle; weekly updates keep working.
+
+## [0.34.10] - 2026-11-03
+
+### Added
+- **A used-up quota now shows how long until it comes back.** When a tool's 5-hour or weekly quota reaches 100%, the menu bar shows the time left, such as `2h55m`, instead of a stuck `100%`. If both are used up, it counts down to the later reset; if the reset time is unknown, it keeps showing `100%`. While a countdown is shown, the menu bar refreshes every minute instead of every five. The Claude Code status line does the same in red and keeps the time left even in a narrow terminal.
+
+### Fixed
+- **The status line no longer freezes quota on plans without a 5-hour limit.** Since Claude Code 2.1.316, accounts with no 5-hour limit (such as the Ultra plan) get only the weekly window. The status line treated that as missing data and kept showing the last full snapshot, so the weekly bar stopped moving and an expired 5-hour bar stayed on screen. Each window now updates on its own; a window Claude Code stops sending disappears once its reset time has passed. The menu bar reads a weekly-only status the same way instead of waiting for both windows. Thanks to @dvdmaru for the report and fix (#273).
+
+## [0.34.9] - 2026-10-30
+
+### Security
+- **Downloaded macOS apps now pass signature verification.** The release zip stored copies in place of the symlinks inside the bundled Python framework, so every download through v0.34.8, Homebrew installs included, failed `codesign --verify` with "bundle format is ambiguous", and any later tampering could not be told apart. Releases are now zipped with `ditto`, which keeps the symlinks, and the release job verifies the zipped app's signature before publishing. The download is about 9 MB smaller.
+
+## [0.34.8] - 2026-10-30
+
+### Security
+- **A masked report no longer leaks project names.** When you hid project names and downloaded the HTML report, each project row still carried its real name in a hidden accessibility label, readable by anyone who opened the file's source. Masking now also covers those labels, tooltips and image descriptions.
+- **Names in an exported CSV no longer run as spreadsheet formulas.** A project or model name starting with `=`, `+`, `-` or `@` was written as-is, so Excel could treat it as a formula. Such names now start with an apostrophe and stay plain text.
+- **A downloaded project can no longer use its Git settings to run a program through Progress Concierge.** Progress Concierge runs `git status` in your project when a session starts, and a repository's own `.git/config` can tell Git to launch a file-system monitor program. usage now switches that monitor off for its check.
+- **The macOS app keeps a valid code signature after it runs.** Python wrote its compiled caches into the app on first launch, which broke the signature and made any later tampering impossible to tell apart. The caches are now built before signing, so nothing inside the app changes while it runs. The app is about 2 MB larger.
+- **Releases are built only from locked, hash-verified build tools.** The PyPI package is built in a step that cannot publish, from a pinned build backend, and the Windows build pins PyInstaller the same way. October's supply-chain attacks published poisoned packages through hijacked release pipelines; this closes that path here. The setuptools used to build the macOS app is also updated to 84.2.1 for GHSA-xmj3-9gf7-h52w.
+
+### Fixed
+- **Turning on Token Saver no longer breaks some Codex configs.** If `~/.codex/config.toml` wrote the features setting as `features = { hooks = false }` or `features.hooks = false`, usage added a second `[features]` section and Codex then refused to load the file. usage now checks the edited file first and leaves it untouched if the edit would not parse.
+- **GPT-6.1 Terra is priced while offline.** Codex's new GPT-6.1 Terra model counted as $0 whenever the price table could not be downloaded. The built-in fallback now carries its price, $1 / $5 per million input / output tokens.
+- **Panel titles no longer cut off the bottoms of g and y.** In the Default, Origami, Stained Glass, Sketchbook, Heart Monitor and Windows 95 panels, titles such as "Antigravity" and "Project Usage" lost the tails of their descenders, because the box that trims long titles was shorter than the letters. The box now has room for them; the layout does not move.
+
+### Removed
+- **The app no longer bundles the retired AI Council window.** Its page was left behind when the feature was removed in v0.30.11, and nothing loaded it.
+
 ## [0.34.7] - 2026-10-23
 
 ### Fixed

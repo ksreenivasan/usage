@@ -11,7 +11,6 @@ import logging
 import math
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 import threading
@@ -22,6 +21,7 @@ from pathlib import Path
 from typing import TypedDict, TypeGuard
 
 from loaders import muse_loader
+from usage_common.cli_lookup import cli_env, resolve_cli
 from usage_common.subprocess_utils import hidden_console_kwargs
 
 logger = logging.getLogger(__name__)
@@ -54,14 +54,9 @@ class MuseQuotaResult(TypedDict):
 
 def find_muse() -> str | None:
     """Find Muse even when the app inherits a limited GUI PATH."""
-    executable = shutil.which("muse")
-    if executable is not None:
-        return executable
-    for candidate in ("~/.local/bin/muse", "/opt/homebrew/bin/muse", "/usr/local/bin/muse"):
-        expanded = os.path.expanduser(candidate)
-        if os.path.isfile(expanded) and os.access(expanded, os.X_OK):
-            return expanded
-    return None
+    return resolve_cli(
+        "muse", ("~/.local/bin/muse", "/opt/homebrew/bin/muse", "/usr/local/bin/muse")
+    )
 
 
 def _number(value: object) -> TypeGuard[int | float]:
@@ -113,6 +108,47 @@ def parse_muse_allowance(stdout: str, checked_at: float) -> MuseQuotaResult | No
         except (ValueError, KeyError, TypeError, OverflowError, RecursionError):
             continue
     return None
+
+
+def parse_muse_usage(stdout: str, checked_at: float) -> MuseQuotaResult | None:
+    """Read ``muse usage --json`` (Muse 1.4.13+); its allowance fields are camelCase."""
+    try:
+        allowance = json.loads(stdout)["allowance"]
+        payload: dict[str, object] = {"checked_at": checked_at}
+        for name in ("window", "weekly"):
+            raw = allowance[name]
+            if not _number(raw["resetsAtMs"]):
+                return None
+            payload[name] = {
+                "used_percent": raw["usedPercent"],
+                "resets_at": raw["resetsAtMs"] / 1000,
+            }
+    except (ValueError, KeyError, TypeError, OverflowError, RecursionError):
+        return None
+    return validate_muse_cache(payload)
+
+
+def read_usage(executable: str) -> MuseQuotaResult | None:
+    """Ask Muse for its last observed allowance without a model call.
+
+    Returns ``None`` when Muse has no reading (e.g. an exhausted window) or predates the command;
+    the caller then falls back to the ``muse exec`` probe.
+    """
+    process = None
+    try:
+        process = _spawn([executable, "usage", "--json"])
+        if process is None:
+            return None
+        stdout, _ = process.communicate(timeout=30)
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        logger.warning("muse usage failed", exc_info=True)
+        return None
+    finally:
+        if process is not None:
+            _stop_process(process)
+    if process.returncode != 0:
+        return None
+    return parse_muse_usage(stdout, time.time())
 
 
 def parse_exhausted_window(
@@ -211,16 +247,34 @@ def _cleanup_probe() -> None:
 atexit.register(_cleanup_probe)
 
 
+def _spawn(args: list[str], cwd: Path | None = None) -> subprocess.Popen[str] | None:
+    """Start a Muse child that ``_cleanup_probe`` can stop; ``None`` once the app is exiting."""
+    global _probe_process
+    with _probe_lock:
+        if _probe_shutdown:
+            return None
+        _probe_process = subprocess.Popen(
+            args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding="utf-8",
+            cwd=cwd,
+            env=cli_env(args[0]),
+            **hidden_console_kwargs(),
+        )
+        return _probe_process
+
+
 def _probe_worker(executable: str) -> None:
     global _probe_running, _retry_after, _probe_process
     succeeded = False
     process = None
     try:
-        PROBE_DIR.mkdir(parents=True, exist_ok=True)
-        with _probe_lock:
-            if _probe_shutdown:
-                return
-            process = subprocess.Popen(
+        result = read_usage(executable)
+        if result is None:
+            PROBE_DIR.mkdir(parents=True, exist_ok=True)
+            process = _spawn(
                 [
                     executable,
                     "exec",
@@ -234,30 +288,27 @@ def _probe_worker(executable: str) -> None:
                     "--json",
                     "Reply with OK only.",
                 ],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                encoding="utf-8",
                 cwd=PROBE_DIR,
-                **hidden_console_kwargs(),
             )
-            _probe_process = process
-        try:
-            stdout, _ = process.communicate(timeout=120)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.communicate()
-            raise
-        if process.returncode == 0:
-            result = parse_muse_allowance(stdout, time.time())
-        else:
-            result = parse_exhausted_window(stdout, read_cache(), time.time())
+            if process is None:
+                return
+            try:
+                stdout, _ = process.communicate(timeout=120)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+                raise
+            if process.returncode == 0:
+                result = parse_muse_allowance(stdout, time.time())
+            else:
+                result = parse_exhausted_window(stdout, read_cache(), time.time())
         if result is not None:
             _write_cache(result)
             succeeded = True
         else:
             logger.warning(
-                "Muse quota probe returned no valid allowance (exit %s)", process.returncode
+                "Muse quota probe returned no valid allowance (exit %s)",
+                None if process is None else process.returncode,
             )
     except (OSError, subprocess.SubprocessError, UnicodeError):
         logger.warning("Muse quota probe failed", exc_info=True)

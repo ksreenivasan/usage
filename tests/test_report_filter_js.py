@@ -179,6 +179,8 @@ function makeEnvironment(
   const projectSection = new Element('section', 'project-section');
   projectSection.append(projectHead, projectList);
 
+  const toolsSection = new Element('section', 'tools-section');
+  toolsSection.append(groupList);
   const tools = groupList;
   const toolRows = groups;
 
@@ -192,7 +194,8 @@ function makeEnvironment(
   compositionSection.append(
     new Element('div', 'prompt'),
     new Element('div', 'rule'),
-    new Element('div', 'rank-list'),
+    new Element('div', 'composition-stack'),
+    new Element('div', 'rank-list composition-legend'),
     new Element('p', 'composition-hint'),
     new Element('div', 'rank-head'),
     new Element('div', 'rank-list'),
@@ -207,6 +210,21 @@ function makeEnvironment(
     new Element('div', 'rule'),
     new Element('div', 'table-wrap'),
   );
+  [toolsSection, projectSection, trendSection, compositionSection, sessionSection]
+    .forEach((section) => {
+      let prompt = section.querySelector('.prompt');
+      if (!prompt) {
+        prompt = new Element('div', 'prompt');
+        section.insertBefore(prompt, section.children[0]);
+      }
+      prompt.append(span('prompt-title'));
+      if (section !== sessionSection) {
+        const subtitle = new Element('p', 'report-subtitle');
+        prompt.after(subtitle);
+        section.append(new Element('p', 'report-source'));
+      }
+    });
+  toolsSection.append(new Element('p', 'report-pricing'));
   const cards = {};
   ['tokens', 'cost', 'sessions', 'messages', 'active', 'peak'].forEach((key) => {
     const card = new Element('div', 'card');
@@ -268,6 +286,7 @@ function makeEnvironment(
     startTime: 'Start time',
     trendCompareDown: 'Last complete week (W{week}) dropped {pct}% vs the preceding week.',
     trendPartialWeek: 'only {days} days',
+    trendIncompleteWeek: 'Incomplete week',
     compositionMissing: 'Another {tokens} tokens have no input/output breakdown.',
     trendCompareFirst: 'Fewer than two complete weeks to compare.',
     trendCompareFlat: 'Roughly flat vs last week.',
@@ -290,6 +309,7 @@ function makeEnvironment(
       if (selector === '#usage-cube-data') return cubeNode;
       if (selector === '#usage-session-data') return sessionNode;
       if (selector === '.project-section') return projectSection;
+      if (selector === '.tools-section') return toolsSection;
       if (selector === '.tools-section .tools') return tools;
       if (selector === '[data-report-period]') return period;
       if (selector === '.trend-section') return trendSection;
@@ -326,7 +346,7 @@ function makeEnvironment(
     groups, groupChildren, groupList, projectHead, projectList, projectRows,
     tools, cards, period, dateFilter, fromInput, toInput,
     shortcutButtons, storageData, trendSection, compositionSection, pricingSection,
-    appendix, sessionSection,
+    appendix, sessionSection, toolsSection, projectSection,
   };
 }
 
@@ -386,17 +406,15 @@ assert.deepEqual(
   ['claude-test', 'gpt-test']
 );
 assert.deepEqual(
-  details.map((row) => row.querySelector('.child-pct').textContent),
+  details.map((row) => row.querySelector('.pct').textContent),
   ['60.0%', '40.0%']
 );
 assert.deepEqual(
-  details.map((row) => row.querySelector('.child-fill').style.width),
+  details.map((row) => row.querySelector('.hbar').style.width),
   ['60.0%', '40.0%']
 );
-assert.deepEqual(
-  details.map((row) => row.querySelector('.scope-tag').textContent),
-  ['Share of project', 'Share of project']
-);
+assert.deepEqual(details.map((row) => row.children.map((child) => child.className)),
+  [['hlabel', 'hlane'], ['hlabel', 'hlane']]);
 assert.deepEqual(details.map((row) => row.querySelector('.cost').textContent), ['$1.25', '—']);
 assert.equal(env.projectHead.children[3].textContent, 'Tokens');
 assert.equal(env.projectHead.children.length, 5);
@@ -423,8 +441,8 @@ assert.equal(rebuiltSingleTool.getAttribute('aria-expanded'), 'true');
 assert.equal(rebuiltSingleTool.nextElementSibling.querySelector('.cost').textContent, '—');
 env.projectList.children.find((row) => row.dataset.projectIndex !== undefined).fire('click');
 const singleDetail = env.projectList.children[1];
-assert.equal(singleDetail.querySelector('.child-pct').textContent, '100.0%');
-assert.equal(singleDetail.querySelector('.child-fill').style.width, '100.0%');
+assert.equal(singleDetail.querySelector('.pct').textContent, '100.0%');
+assert.equal(singleDetail.querySelector('.hbar').style.width, '100.0%');
 assert.equal(singleDetail.querySelector('.tokens').textContent, '10');
 assert.equal(singleDetail.querySelector('.cost').textContent, '—');
 console.log('single row/model: 100.0%, 10 tokens, unpriced dash; storage errors safe');
@@ -451,7 +469,7 @@ env.projectList.children.find((row) => row.dataset.projectIndex !== undefined).f
 const unpricedDetails = env.projectList.children.slice(1);
 assert.deepEqual(unpricedDetails.map((row) => row.querySelector('.cost').textContent), ['—', '—']);
 assert.deepEqual(
-  unpricedDetails.map((row) => row.querySelector('.child-pct').textContent),
+  unpricedDetails.map((row) => row.querySelector('.pct').textContent),
   ['75.0%', '25.0%']
 );
 console.log('all unpriced: two dashes; shares 75.0% + 25.0%');
@@ -484,11 +502,11 @@ assert.deepEqual(
   ['full-model', 'zero-model']
 );
 assert.deepEqual(
-  zeroDetails.map((row) => row.querySelector('.child-pct').textContent),
+  zeroDetails.map((row) => row.querySelector('.pct').textContent),
   ['100.0%', '0.0%']
 );
 assert.deepEqual(
-  zeroDetails.map((row) => row.querySelector('.child-fill').style.width),
+  zeroDetails.map((row) => row.querySelector('.hbar').style.width),
   ['100.0%', '0.0%']
 );
 assert.deepEqual(
@@ -621,8 +639,8 @@ function applyFilter(from, to) {
 }
 
 function trendRows() {
-  const trend = sectionBody(filterEnv.trendSection)[0];
-  return trend.children.filter((child) => child.classList.contains('trend-row'));
+  const trend = filterEnv.trendSection.querySelector('.trend');
+  return trend.querySelectorAll('.weekly-column');
 }
 
 // Cross-year ISO week 2025-12-29..2026-01-04 is 2026-W1; tokens 100, cost $1.
@@ -633,7 +651,8 @@ const crossRows = trendRows();
 assert.equal(crossRows.length, 1);
 assert.equal(crossRows[0].querySelector('.week').textContent, 'W1 (12/29–01/04)');
 assert.equal(crossRows[0].querySelector('em').textContent, '100');
-assert.equal(crossRows[0].getAttribute('title'), '2025-12-29 – 2026-01-04 · 100 · $1.00');
+assert.equal(crossRows[0].getAttribute('title'),
+  'W1 (12/29–01/04) · 2025-12-29 – 2026-01-04 · 100 · $1.00');
 assert.equal(crossRows[0].querySelector('.delta').textContent, '');
 assert.equal(
   filterEnv.trendSection.querySelector('.trend-summary').textContent,
@@ -851,6 +870,25 @@ for (const [peak, ceiling] of [
   assert.equal(axisEnv.trendSection.querySelector('.daily-y-label').textContent, ceiling);
 }
 console.log('daily chart: date range rebuilds pricing; tokens/cost toggle redraws');
+
+// Name fields must stay text in spreadsheet apps; numeric fields remain numeric.
+for (const name of ['=1+1', '-cmd', '+cmd', '@cmd', '\tcmd', '\rcmd', '=1,"x"']) {
+  const formulaCube = {
+    dates: ['2026-05-21'],
+    agents: [{id: 'codex', name: 'Codex'}],
+    models: [{name, cost_known: true}],
+    projects: [name],
+    rows: [[0, 0, 0, 0, 10, 0, 0, 0, -3, 1]],
+  };
+  run(makeEnvironment(formulaCube, {}));
+  const safeName = "'" + name;
+  const field = /[",\r\n]/.test(safeName)
+    ? `"${safeName.replace(/"/g, '""')}"` : safeName;
+  assert.equal(
+    window.usageReportFilter.buildCsv(false),
+    `type,name,share_pct,tokens,cost_usd\r\nproject,${field},100.0,10,-3.00\r\nmodel,${field},100.0,10,-3.00\r\n`
+  );
+}
 """
 
 
@@ -862,12 +900,11 @@ def test_collapsed_rank_lines_are_actually_hidden_by_css() -> None:
 
     assert ".rank-line[hidden]{display:none}" in REPORT_CSS
     assert ".composition-section[hidden]{display:none}" in REPORT_CSS
-    assert (
-        ".rank-head,.rank-line{display:grid;grid-template-columns:20px minmax(0,1fr) 110px 110px;"
-    ) in REPORT_CSS
-    assert ".child-track{width:48px;" in REPORT_CSS
-    assert "inset 3px 0 0 var(--warn)" in REPORT_CSS
-    assert "padding-left:34px" in REPORT_CSS
+    assert ".hchart .rank-line[hidden]{display:none}" in REPORT_CSS
+    assert "grid-template-columns:var(--label) minmax(0,1fr)" in REPORT_CSS
+    assert ".hchart .model-child .hbar{opacity:.45}" in REPORT_CSS
+    assert ".hchart .model-child .hlane,.hchart .model-child .hbar{height:10px}" in REPORT_CSS
+    assert ".hchart .model-child .hlabel{padding-left:20px}" in REPORT_CSS
 
 
 def test_report_filter_javascript_interactions_and_boundaries(tmp_path: Path) -> None:
@@ -897,3 +934,57 @@ def test_report_filter_javascript_interactions_and_boundaries(tmp_path: Path) ->
         "ledger: filtered totals retained; composition, hit rates, sessions unchanged",
         "daily chart: date range rebuilds pricing; tokens/cost toggle redraws",
     ]
+
+
+@pytest.mark.skipif(NODE is None, reason="Node.js is unavailable")
+def test_shortcuts_use_generation_date_and_render_empty_charts(tmp_path: Path) -> None:
+    prefix = NODE_HARNESS.split("const cube = {", 1)[0]
+    script = prefix.replace("__REPORT_DAILY_CHART_JS__", json.dumps(REPORT_DAILY_CHART_JS)).replace(
+        "__REPORT_FILTER_JS__", json.dumps(REPORT_FILTER_JS)
+    )
+    script += r"""
+const cube = {
+  today: '2026-11-04',
+  dates: ['2026-10-01', '2026-10-30'],
+  agents: [{id: 'codex', name: 'Codex'}],
+  models: [{name: 'gpt-demo', cost_known: true}],
+  projects: ['demo'],
+  rows: [[1, 0, 0, 0, 100, 0, 0, 0, 1, 1]],
+};
+const env = run(makeEnvironment(cube, {}, false, [], true));
+const api = window.usageReportFilter;
+for (const [key, from, to, tokens] of [
+  ['today', '2026-11-04', '2026-11-04', 0],
+  ['last7', '2026-10-29', '2026-11-04', 100],
+  ['last30', '2026-10-06', '2026-11-04', 100],
+  ['month', '2026-11-01', '2026-11-04', 0],
+]) {
+  assert.deepEqual(api.rangeBounds(key), {from, to});
+  const summary = api.applyBounds(api.rangeBounds(key));
+  assert.equal(summary.tokens, tokens);
+  const rendered = JSON.stringify([
+    summary, env.toolsSection.textContent, env.projectSection.textContent,
+    env.trendSection.textContent, env.compositionSection.textContent,
+    env.sessionSection.textContent, env.pricingSection.textContent,
+  ]);
+  assert.equal(rendered.includes('NaN'), false);
+  assert.equal(rendered.includes('Infinity'), false);
+}
+assert.deepEqual(api.normalizeBounds('2026-11-04', '2099-01-01'),
+  {from: '2026-11-04', to: '2026-11-04'});
+// An old report still uses its last data day.
+delete cube.today;
+run(makeEnvironment(cube));
+assert.deepEqual(window.usageReportFilter.rangeBounds('today'),
+  {from: '2026-10-30', to: '2026-10-30'});
+// Future data remains accessible, while shortcuts use the generation date.
+cube.today = '2026-10-15';
+run(makeEnvironment(cube));
+assert.deepEqual(window.usageReportFilter.rangeBounds('today'),
+  {from: '2026-10-15', to: '2026-10-15'});
+assert.deepEqual(window.usageReportFilter.normalizeBounds('2026-10-01', '2099-01-01'),
+  {from: '2026-10-01', to: '2026-10-30'});
+"""
+    path = tmp_path / "shortcuts.cjs"
+    path.write_text(script, encoding="utf-8")
+    subprocess.run([NODE or "node", str(path)], check=True, capture_output=True, text=True)

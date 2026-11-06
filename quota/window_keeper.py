@@ -33,8 +33,8 @@ dispatches a one-line call into :func:`maybe_ping`.
 from __future__ import annotations
 
 import logging
+import math
 import os
-import shutil
 import subprocess
 import threading
 import time
@@ -42,6 +42,7 @@ from pathlib import Path
 
 from menubar.prefs import _window_keeper_enabled
 from quota import keeper_outcome
+from usage_common.cli_lookup import cli_env, resolve_cli
 from usage_common.subprocess_utils import hidden_console_kwargs
 
 logger = logging.getLogger(__name__)
@@ -60,10 +61,8 @@ PING_TIMEOUT_SECONDS = 180
 # window the previous ping opened.
 PING_COOLDOWN_SECONDS = 5 * 3600 + 300
 
-# loaders.claude_usage defaults a missing ``resets_at`` to parse-time "now", which one
-# refresh later reads as "expired seconds ago". Requiring the expiry to be at
-# least this old filters those synthetic timestamps without delaying a real
-# expired-while-away ping by more than two minutes.
+# Wait briefly after a real reset before opening the next window, allowing
+# quota observations around the reset boundary to settle.
 PING_EXPIRY_GRACE_SECONDS = 120
 
 # ``claude`` binary resolution order: PATH first, then the well-known install
@@ -132,14 +131,7 @@ def _save_ping_state(reset_at: float, ping_at: float, path: Path | None = None) 
 
 
 def _resolve_claude_bin() -> str | None:
-    found = shutil.which("claude")
-    if found:
-        return found
-    for candidate in _CLAUDE_BIN_FALLBACKS:
-        resolved = os.path.expanduser(candidate)
-        if os.path.isfile(resolved) and os.access(resolved, os.X_OK):
-            return resolved
-    return None
+    return resolve_cli("claude", _CLAUDE_BIN_FALLBACKS)
 
 
 def _try_acquire() -> bool:
@@ -186,6 +178,7 @@ def _run_claude_ping(claude_bin: str) -> subprocess.CompletedProcess[str]:
         timeout=PING_TIMEOUT_SECONDS,
         cwd=os.path.expanduser("~"),
         check=False,
+        env=cli_env(claude_bin),
         **hidden_console_kwargs(),
     )
 
@@ -201,6 +194,35 @@ def _ping_worker(started_at: float) -> None:
         keeper_outcome.record_result(WINDOW_KEEPER_STATE_PATH, fields)
     finally:
         _release()
+
+
+def _recall_expired_window(
+    state: dict[str, object],
+    current_reset_at: float | None,
+    current_percent: float | None,
+    data_source: str,
+) -> tuple[float | None, float | None]:
+    """Stand in the last reported five-hour reset once the payload drops the window.
+
+    Claude Code omits ``five_hour`` once its ``resets_at`` has passed, and the
+    statusLine hook drops the cached copy too (plans without a 5-hour limit never
+    send one), so an expired window reaches us as no window at all. The reader
+    then reports no percent and no reset, which is not worth keeping.
+    Remember every real reset the hook reports; a plan that never reported one
+    stays unarmed.
+    """
+    if data_source != "hook":
+        return current_reset_at, current_percent
+    remembered = keeper_outcome.numeric_value(state, "last_seen_reset_at")
+    if current_percent is None:
+        return (current_reset_at, None) if remembered is None else (remembered, 0.0)
+    if current_reset_at is None or not math.isfinite(current_reset_at):
+        return None, current_percent
+    if current_reset_at is not None and current_reset_at != remembered:
+        keeper_outcome.update_state(
+            WINDOW_KEEPER_STATE_PATH, {"last_seen_reset_at": current_reset_at}
+        )
+    return current_reset_at, current_percent
 
 
 def maybe_ping(
@@ -224,6 +246,9 @@ def maybe_ping(
     now = time.time()
     last_pinged_reset_at, last_ping_at = _load_ping_state()
     state = keeper_outcome.read_state(WINDOW_KEEPER_STATE_PATH)
+    current_reset_at, current_percent = _recall_expired_window(
+        state, current_reset_at, current_percent, data_source
+    )
     idle = should_ping(now, current_reset_at, enabled, None, None, current_percent, data_source)
     fresh = should_ping(
         now,

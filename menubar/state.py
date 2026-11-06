@@ -106,6 +106,7 @@ class QuotaRowState:
     available: bool = True
     reset_text_compact: str = ""
     reset_done: bool = False
+    resets_at: float | None = None
 
     # Keep percent unchanged for quota notifications; renderers use display_percent.
 
@@ -570,14 +571,12 @@ def project_rows_for_windows(
     current_time = datetime.now(UTC) if now is None else now
     local_now = current_time.astimezone()
     local_today = local_now.date()
-    local_tz = local_now.tzinfo
-    assert local_tz is not None
-    today_start = datetime.combine(local_today, datetime_time.min, tzinfo=local_tz).astimezone(UTC)
+    today_start = datetime.combine(local_today, datetime_time.min).astimezone(UTC)
     tomorrow_start = datetime.combine(
-        local_today + timedelta(days=1), datetime_time.min, tzinfo=local_tz
+        local_today + timedelta(days=1), datetime_time.min
     ).astimezone(UTC)
     yesterday_start = datetime.combine(
-        local_today - timedelta(days=1), datetime_time.min, tzinfo=local_tz
+        local_today - timedelta(days=1), datetime_time.min
     ).astimezone(UTC)
     cutoff_7d = current_time - timedelta(hours=168)
     cutoff_30d = current_time - timedelta(hours=720)
@@ -902,7 +901,8 @@ def build_popover_state(
             CLAUDE_COLOR,
             language,
             forecast_seconds=burn_rate_trackers["claude_session"].forecast_seconds(),
-            allow_unknown_reset=snapshot.data_source == "claude-desktop",
+            # The hook reader leaves a missing five_hour resets_at unknown.
+            allow_unknown_reset=True,
         )
         claude_weekly = _quota_row(
             _t(language, "weekly_label"),
@@ -1083,6 +1083,7 @@ def _quota_row(
         warning=warning,
         available=True,
         reset_done=time_to_reset <= 0,
+        resets_at=resets_at,
     )
     if warning_seconds is not None:
         row.reset_text_compact = _t(

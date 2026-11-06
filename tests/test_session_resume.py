@@ -128,7 +128,101 @@ def _write_session(
     lines.append(
         {"type": "assistant", "timestamp": when.isoformat(), "message": {"content": content}}
     )
+    results = []
+    for index, part in enumerate(content):
+        part["id"] = f"toolu_{index}"
+        results.append({"type": "tool_result", "tool_use_id": part["id"], "content": "Success"})
+    lines.append({"type": "user", "timestamp": when.isoformat(), "message": {"content": results}})
     path.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("name", ["Bash", "Edit", "Write", "NotebookEdit"])
+@pytest.mark.parametrize(
+    "outcome", ["failed", "success", "implicit_success", "missing", "unmatched", "early"]
+)
+def test_parse_session_counts_only_successful_tools(
+    tmp_path: Path, name: str, outcome: str
+) -> None:
+    when = datetime.now().astimezone().isoformat()
+    tool_input = (
+        {"command": 'git commit -m "fix: parser"'}
+        if name == "Bash"
+        else {"file_path": "/project/parser.py"}
+    )
+    lines = [
+        {"type": "user", "timestamp": when, "message": {"content": "fix the parser"}},
+        {
+            "type": "assistant",
+            "timestamp": when,
+            "message": {
+                "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": name, "input": tool_input}
+                ]
+            },
+        },
+    ]
+    if outcome != "missing":
+        result: dict[str, object] = {
+            "type": "tool_result",
+            "tool_use_id": "toolu_other" if outcome == "unmatched" else "toolu_1",
+            "content": "pre-commit hook rejected the commit" if outcome == "failed" else "Success",
+        }
+        if outcome != "implicit_success":
+            result["is_error"] = outcome == "failed"
+        lines.append({"type": "user", "timestamp": when, "message": {"content": [result]}})
+        if outcome == "early":
+            lines.insert(1, lines.pop())
+    path = tmp_path / "session.jsonl"
+    path.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
+
+    parsed = mod._parse_session(path)
+
+    assert parsed is not None
+    assert parsed[1] == "fix the parser"
+    successful = outcome in {"success", "implicit_success"}
+    assert parsed[2] == (["fix: parser"] if successful and name == "Bash" else [])
+    assert parsed[4] == (["parser.py"] if successful and name != "Bash" else [])
+
+
+def test_parse_session_keeps_tool_order_and_deduplication(tmp_path: Path) -> None:
+    when = datetime.now().astimezone().isoformat()
+    tools = []
+    for name in ("Bash", "Edit"):
+        for index, label in enumerate(("first", "second", "first")):
+            tools.append(
+                {
+                    "type": "tool_use",
+                    "id": f"toolu_{name}_{index}",
+                    "name": name,
+                    "input": (
+                        {"command": f'git commit -m "fix: {label}"'}
+                        if name == "Bash"
+                        else {"file_path": f"/project/{label}.py"}
+                    ),
+                }
+            )
+    lines = [
+        {"type": "assistant", "timestamp": when, "message": {"content": tools}},
+        {
+            "type": "user",
+            "timestamp": when,
+            "message": {
+                "content": [
+                    {"type": "tool_result", "tool_use_id": tool["id"], "content": "Success"}
+                    for tool in reversed(tools)
+                ]
+            },
+        },
+    ]
+    path = tmp_path / "session.jsonl"
+    path.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
+
+    parsed = mod._parse_session(path)
+
+    assert parsed is not None
+    assert parsed[1] == ""
+    assert parsed[2] == ["fix: first", "fix: second"]
+    assert parsed[4] == ["first.py", "second.py"]
 
 
 def _project_dir(tmp_path: Path) -> Path:
@@ -294,6 +388,48 @@ def test_git_dirty_includes_untracked_directory_and_keeps_other_paths(tmp_path: 
     assert "tracked.py" in files
     assert "new-name.py" in files
     assert "new-feature" in files
+
+
+def test_git_dirty_disables_repository_fsmonitor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+    (repo / "tracked.py").write_text("before\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Test User",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "initial",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    monitor = tmp_path / "fsmonitor"
+    marker = tmp_path / "fsmonitor.marker"
+    monitor.write_text('#!/bin/sh\n: > "$0.marker"\n', encoding="utf-8")
+    monitor.chmod(0o700)
+    subprocess.run(["git", "-C", str(repo), "config", "core.fsmonitor", str(monitor)], check=True)
+    (repo / "tracked.py").write_text("after\n", encoding="utf-8")
+
+    dirty = mod._git_dirty(str(repo))
+
+    assert not marker.exists()
+    assert dirty is not None
+    assert dirty[1:] == (1, ["tracked.py"])
 
 
 def test_build_prompt_reads_previous_session(
@@ -505,6 +641,51 @@ def test_build_prompt_reads_last_prompt_entry(
     )
 
     assert "refactor the parser" in prompt
+
+
+def test_build_prompt_skips_bang_shell_runs_in_last_prompt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("USAGE_LANG", "en")
+    _sidecar(tmp_path, monkeypatch)
+    project = _project_dir(tmp_path)
+    when = datetime.now().astimezone() - timedelta(hours=1)
+    # Claude Code records a `!` run twice: a `<bash-input>` user turn and a
+    # `last-prompt` entry that keeps the `!` prefix.
+    (project / "prev.jsonl").write_text(
+        "\n".join(
+            json.dumps(line)
+            for line in [
+                {
+                    "type": "user",
+                    "timestamp": when.isoformat(),
+                    "message": {"content": "merge both PRs once CI is green"},
+                },
+                {
+                    "type": "user",
+                    "timestamp": when.isoformat(),
+                    "message": {"content": "<bash-input> gh pr merge 288 --merge</bash-input>"},
+                },
+                {
+                    "type": "last-prompt",
+                    "timestamp": when.isoformat(),
+                    "lastPrompt": "!  gh pr merge 288 --merge",
+                },
+                {"type": "assistant", "timestamp": when.isoformat(), "message": {"content": []}},
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    current = project / "current.jsonl"
+    current.write_text("", encoding="utf-8")
+
+    prompt = mod._build_prompt(
+        {"transcript_path": str(current), "cwd": "/Users/me/Developer/myproj"}
+    )
+
+    assert "merge both PRs once CI is green" in prompt
+    assert "gh pr merge 288" not in prompt
 
 
 def test_build_prompt_uses_first_substantive_task_not_trailing_reaction(

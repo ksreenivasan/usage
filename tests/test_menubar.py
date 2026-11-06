@@ -70,6 +70,9 @@ class _FakeMenu:
         self.title = title
         return self
 
+    def setAutoenablesItems_(self, enabled: bool) -> None:
+        self.autoenables = enabled
+
     def addItem_(self, item: _FakeMenuItem) -> None:
         self.items.append(item)
 
@@ -114,6 +117,9 @@ class _FakeMenuItem:
         self.action = action
         self.key = key
         return self
+
+    def setTitle_(self, title: str) -> None:
+        self.title = title
 
     def setTarget_(self, target: object) -> None:
         self.target = target
@@ -705,9 +711,9 @@ def test_switch_panel_menu_contains_update_items(
     _FakeMenu.instances = []
     menubar.AppDelegate.switchPanel_(delegate, object())
 
-    # Four menus are built: the main popup, the panel-themes submenu, the
-    # provider-visibility submenu, and the Claude Code submenu.
-    main_menu, panel_submenu, hide_submenu, claude_submenu = _FakeMenu.instances
+    main_menu, panel_submenu, hide_submenu, notification_submenu, claude_submenu = (
+        _FakeMenu.instances
+    )
     main_titles = [item.title for item in main_menu.items]
 
     # The auto-update row is gone — update checks just stay on by default.
@@ -759,6 +765,8 @@ def test_switch_panel_menu_contains_update_items(
         "---",
         "Claude Code",
     ]
+    assert settings[1].submenu is notification_submenu
+    assert settings[1].state == 1
     assert settings[7].submenu is claude_submenu
     assert [item.title for item in claude_submenu.items] == [
         "Sync quota via status line",
@@ -1094,21 +1102,42 @@ def test_statusline_enabled_detects_usage_hook(
     assert menubar._statusline_enabled() is True
 
 
+@pytest.mark.parametrize("command", ["python3 custom-statusline.py", "python3 tt-statusline.py"])
 def test_statusline_enabled_detects_external_hook(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    command: str,
 ) -> None:
     claude_dir = tmp_path / ".claude"
     claude_dir.mkdir()
     settings = claude_dir / "settings.json"
-    legacy_name = "tt" + "-statusline.py"
     settings.write_text(
-        json.dumps({"statusLine": {"type": "command", "command": f"python3 {legacy_name}"}}),
+        json.dumps({"statusLine": {"type": "command", "command": command}}),
         encoding="utf-8",
     )
     monkeypatch.setattr(statusline_settings, "_claude_settings_path", lambda: settings)
 
-    assert menubar._statusline_enabled() is True
+    monkeypatch.setattr("installer.setup_hook.is_agy_setup", lambda: False)
+    assert menubar._statusline_enabled() is False
+
+
+def test_disable_statusline_keeps_external_claude_statusline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # With agy's status line installed the switch shows on; turning it off must
+    # not stash a Claude status line that belongs to another tool.
+    from installer import setup_hook
+
+    settings = tmp_path / "settings.json"
+    external = {"type": "command", "command": "printf external"}
+    settings.write_text(json.dumps({"statusLine": external}), encoding="utf-8")
+    monkeypatch.setattr(statusline_settings, "_claude_settings_path", lambda: settings)
+    monkeypatch.setattr(setup_hook, "_unsetup_agy", lambda: True)
+    monkeypatch.setattr(setup_hook, "_unsetup_grok", lambda: True)
+
+    assert menubar._disable_statusline_settings() == 0
+    assert json.loads(settings.read_text(encoding="utf-8")) == {"statusLine": external}
 
 
 def test_toggle_statusline_preserves_forwarder_settings(
@@ -1122,13 +1151,13 @@ def test_toggle_statusline_preserves_forwarder_settings(
         "env": {"KEEP": "1"},
         "statusLine": {
             "type": "command",
-            "command": "python3 ~/.claude/" + "tt" + "-statusline-usage-statusline-forward.py",
+            "command": "python3 ~/.claude/usage-statusline-forwarder.py",
         },
     }
     settings.write_text(json.dumps(original, indent=2, ensure_ascii=False), encoding="utf-8")
     original_text = settings.read_text(encoding="utf-8")
     # The forwarder target must exist, or re-enabling falls through to a fresh setup().
-    forwarder = claude_dir / ("tt" + "-statusline-usage-statusline-forward.py")
+    forwarder = claude_dir / "usage-statusline-forwarder.py"
     forwarder.write_text("", encoding="utf-8")
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
@@ -2363,9 +2392,13 @@ def test_set_button_title_skips_unchanged_visible_state(
     delegate.codex_5h_pct = 12
     monkeypatch.setattr(menubar_title, "_menubar_attributed_title", lambda app, current: object())
 
+    intervals: list[float] = []
+    monkeypatch.setattr(delegate, "_panel_window_is_visible", lambda: False)
+    monkeypatch.setattr(delegate, "_reschedule_poll_timer", intervals.append)
     menubar_title._set_button_title(delegate, state)
     menubar_title._set_button_title(delegate, state)
 
+    assert intervals == [300.0, 300.0]
     assert len(button.titles) == 1
     assert len(button.attributed_titles) == 1
 
@@ -3312,7 +3345,12 @@ def test_panel_window_hide_prunes_cache_and_keeps_slow_poll() -> None:
     controller = SimpleNamespace(evictInactivePanelViews=Mock())
     reschedule = Mock()
     delegate = SimpleNamespace(
-        popover_controller=controller, interval=60, _reschedule_poll_timer=reschedule
+        popover_controller=controller,
+        interval=60,
+        _reschedule_poll_timer=reschedule,
+        _panel_window_is_visible=lambda: False,
+        latest_state=menubar._empty_state(),
+        codex_5h_pct=None,
     )
     menubar.AppDelegate._panel_window_did_hide(cast(Any, delegate))
     controller.evictInactivePanelViews.assert_called_once_with()
@@ -3419,3 +3457,412 @@ def test_refresh_preserves_muse_on_success_and_fetch_error(
         assert "OSError" in result.status_text
     else:
         assert result.status_text == _t("en", "status_text", value=_t("en", "status_no_data"))
+
+
+@pytest.mark.parametrize(
+    ("seconds", "expected"),
+    [
+        (0, "0m"),
+        (59, "1m"),
+        (60, "1m"),
+        (3599, "1h0m"),
+        (3600, "1h0m"),
+        (10500, "2h55m"),
+        (86400, "1d0h"),
+        (273000, "3d3h"),
+        (274200, "3d4h"),
+    ],
+)
+def test_menubar_countdown_format(seconds: float, expected: str) -> None:
+    assert menubar_title._format_countdown(seconds) == expected
+
+
+@pytest.mark.parametrize("tool", ["claude", "codex", "agy", "grok", "muse"])
+@pytest.mark.parametrize(
+    ("session_pct", "session_reset", "weekly_pct", "weekly_reset", "expected"),
+    [
+        (100, 10500, 30, None, "2h55m"),
+        (30, None, 100, 274200, "3d4h"),
+        (100, 10500, 100, 274200, "3d4h"),
+        (100, None, 30, None, "100%"),
+        (100, 0, 30, None, "100%"),
+        (100, -60, 30, None, "100%"),
+        (100, 10500, 100, None, "100%"),
+        (100, 10500, 100, 0, "100%"),
+        (30, None, 99, 10500, "30%"),
+    ],
+)
+def test_menubar_tool_countdown(
+    monkeypatch: pytest.MonkeyPatch,
+    tool: str,
+    session_pct: float,
+    session_reset: float | None,
+    weekly_pct: float,
+    weekly_reset: float | None,
+    expected: str,
+) -> None:
+    monkeypatch.setattr(menubar, "_load_preferences", lambda: {})
+    state = menubar._empty_state()
+    for name in ("claude", "codex", "agy", "grok", "muse"):
+        setattr(state, f"hide_{name}", name != tool)
+    now = 1000000.0
+    if tool == "grok":
+        # Grok has only a weekly row; exercise the session cases on that row.
+        rows = [(state.grok_weekly, session_pct, session_reset)]
+        expected = "2h55m" if session_pct >= 100 and session_reset == 10500 else f"{session_pct}%"
+    else:
+        rows = [
+            (getattr(state, f"{tool}_session"), session_pct, session_reset),
+            (getattr(state, f"{tool}_weekly"), weekly_pct, weekly_reset),
+        ]
+    for row, percent, reset in rows:
+        row.percent = percent
+        row.reset_done = False
+        row.resets_at = None if reset is None else now + reset
+    app = cast(Any, SimpleNamespace(codex_5h_pct=session_pct))
+    assert [text for _icon, text in menubar_title._menubar_items(app, state, now)] == [expected]
+
+
+@pytest.mark.parametrize(
+    ("visible", "reset", "interval", "expected"),
+    [
+        (False, 10500, 60, 60),
+        (False, None, 60, 300),
+        (False, 0, 60, 300),
+        (True, None, 60, 60),
+        (False, None, 600, 600),
+    ],
+)
+def test_menubar_poll_interval(
+    monkeypatch: pytest.MonkeyPatch,
+    visible: bool,
+    reset: float | None,
+    interval: float,
+    expected: float,
+) -> None:
+    monkeypatch.setattr(menubar, "_load_preferences", lambda: {})
+    monkeypatch.setattr(time, "time", lambda: 1000000.0)
+    state = menubar._empty_state()
+    state.claude_session.percent = 100
+    state.claude_session.resets_at = None if reset is None else 1000000.0 + reset
+    app = cast(
+        Any,
+        SimpleNamespace(
+            codex_5h_pct=None,
+            interval=interval,
+            _panel_window_is_visible=lambda: visible,
+        ),
+    )
+    assert menubar_title.menubar_poll_interval(app, state) == expected
+    state.hide_claude = True
+    if not visible:
+        assert menubar_title.menubar_poll_interval(app, state) == max(interval, 300)
+
+
+@pytest.mark.parametrize("age_minutes", [0, 10])
+def test_agy_projection_shows_recovery_countdown_and_short_poll(
+    monkeypatch: pytest.MonkeyPatch, age_minutes: int
+) -> None:
+    from loaders.agy_quota_probe import AgyQuotaGroup, AgyQuotaResult, AgyQuotaWindow
+
+    now = 1_800_000_000.0
+    monkeypatch.setattr(time, "time", lambda: now)
+    monkeypatch.setattr(menubar, "_load_preferences", lambda: {})
+    quota = AgyQuotaResult(
+        groups=[
+            AgyQuotaGroup(
+                name="GEMINI MODELS",
+                models=["gemini"],
+                five_hour=AgyQuotaWindow(0, None, 90 + age_minutes),
+                weekly=AgyQuotaWindow(90, None, 1440),
+            )
+        ],
+        fetched_at=datetime.fromtimestamp(now - age_minutes * 60, UTC).isoformat(),
+    )
+    projection = menubar_agy.project_quota(quota, "en", now=now)
+    assert projection is not None
+    state = menubar._empty_state()
+    for tool in ("claude", "codex", "grok", "muse"):
+        setattr(state, f"hide_{tool}", True)
+    state.hide_agy = False
+    state.agy_session = projection.session
+    state.agy_weekly = projection.weekly
+    app = cast(
+        Any,
+        SimpleNamespace(codex_5h_pct=None, interval=60, _panel_window_is_visible=lambda: False),
+    )
+    assert projection.session.resets_at == now + 5400
+    assert [text for _icon, text in menubar_title._menubar_items(app, state, now)] == ["1h30m"]
+    assert menubar_title.menubar_poll_interval(app, state) == 60
+
+
+def test_menubar_countdown_ranks_as_full_and_preserves_codex_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(menubar, "_load_preferences", lambda: {})
+    state = menubar._empty_state()
+    state.claude_session.percent = 30
+    state.claude_weekly.percent = 100
+    state.claude_weekly.resets_at = 1010500.0
+    state.codex_session.percent = 80
+    state.agy_session.percent = 60
+    state.muse_session.percent = 50
+    state.hide_agy = state.hide_muse = False
+    app = cast(Any, SimpleNamespace(codex_5h_pct=40))
+    assert [text for _icon, text in menubar_title._menubar_items(app, state, 1000000)] == [
+        "2h55m",
+        "60%",
+        "50%",
+    ]
+    state.hide_agy = state.hide_muse = True
+    assert [text for _icon, text in menubar_title._menubar_items(app, state, 1000000)] == [
+        "2h55m",
+        "40%",
+    ]
+
+
+@pytest.mark.parametrize("content", ["{broken JSON", "[]"])
+@pytest.mark.parametrize("debug", ["0", "1"])
+def test_forwarder_prompt_skips_invalid_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    content: str,
+    debug: str,
+) -> None:
+    from installer import setup_hook
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(content)
+    monkeypatch.setattr(setup_hook, "_claude_settings_path", lambda: settings)
+    monkeypatch.setenv("USAGE_DEBUG", debug)
+
+    def unexpected_alert() -> None:
+        pytest.fail("invalid settings must skip the prompt")
+
+    monkeypatch.setattr(menubar_actions, "_make_alert", unexpected_alert)
+    menubar_actions.show_forwarder_mode_prompt_if_needed("en")
+
+    assert settings.read_text() == content
+    assert ("forwarder prompt check failed" in caplog.text) == (debug == "1")
+
+
+@pytest.mark.parametrize("content", ["{broken JSON", "[]"])
+def test_main_reaches_menubar_with_invalid_claude_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    content: str,
+) -> None:
+    import main
+    from installer import setup_hook
+    from usage_common import usage_dir_sweeper
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(content)
+    monkeypatch.setattr(setup_hook, "_claude_settings_path", lambda: settings)
+    monkeypatch.setattr(main, "PREFERENCES_FILE", tmp_path / "preferences.json")
+    monkeypatch.setattr(usage_dir_sweeper, "sweep_stale_temp_files", lambda: None)
+    monkeypatch.setattr(sys, "argv", ["usage"])
+    calls: list[dict[str, object]] = []
+    fake_menubar = SimpleNamespace(
+        show_forwarder_mode_prompt_if_needed=menubar_actions.show_forwarder_mode_prompt_if_needed,
+        run_app=lambda **kwargs: calls.append(kwargs),
+    )
+    monkeypatch.setattr(main, "_import_module_with_oserror_retry", lambda name: fake_menubar)
+
+    main.main()
+
+    assert len(calls) == 1
+    assert settings.read_text() == content
+
+
+@pytest.mark.parametrize("result", [1000, 1001])
+def test_forwarder_prompt_survives_settings_corrupted_during_alert(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    result: int,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from installer import setup_hook
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"statusLine": {"type": "command", "command": "echo external"}}))
+    monkeypatch.setattr(setup_hook, "_claude_settings_path", lambda: settings)
+    monkeypatch.setattr(setup_hook, "_migrate_from_legacy_usage", lambda: None)
+    monkeypatch.setenv("USAGE_DEBUG", "1")
+
+    def show_alert() -> int:
+        settings.write_text("{broken JSON")
+        return result
+
+    alert = SimpleNamespace(
+        setMessageText_=lambda text: None,
+        setInformativeText_=lambda text: None,
+        addButtonWithTitle_=lambda text: None,
+        runModal=show_alert,
+    )
+    monkeypatch.setattr(menubar_actions, "_make_alert", lambda: alert)
+
+    menubar_actions.show_forwarder_mode_prompt_if_needed("en")
+
+    assert settings.read_text() == "{broken JSON"
+    assert "forwarder prompt dismissal failed" in caplog.text
+    assert ("forwarder setup failed" in caplog.text) == (result == 1000)
+
+
+def test_button_title_refreshes_icons_when_top_providers_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    def quota(percent: int) -> menubar_state.QuotaRowState:
+        return menubar_state._quota_row(
+            "Session", percent, time.time() + 3600, time.time(), menubar_state.CLAUDE_COLOR
+        )
+
+    state = replace(
+        menubar._empty_state(language="en"),
+        hide_claude=False,
+        hide_codex=False,
+        hide_agy=False,
+        hide_grok=False,
+        hide_muse=True,
+        claude_session=quota(50),
+        codex_session=quota(40),
+        agy_session=quota(30),
+        grok_weekly=quota(20),
+    )
+    plain: list[str] = []
+    drawn: list[object] = []
+    button = SimpleNamespace(setTitle_=plain.append, setAttributedTitle_=drawn.append)
+    app = SimpleNamespace(
+        interval=60,
+        codex_5h_pct=40,
+        _last_button_title_key=None,
+        _last_plain_title_key=None,
+        status_item=SimpleNamespace(button=lambda: button),
+        _panel_window_is_visible=lambda: False,
+        _reschedule_poll_timer=lambda interval: None,
+    )
+    monkeypatch.setattr(
+        menubar_title,
+        "_menubar_attributed_title",
+        lambda app, state: menubar_title._menubar_items(app, state),
+    )
+    menubar_title._set_button_title(app, state)
+    state = replace(state, agy_session=quota(0), grok_weekly=quota(30))
+    menubar_title._set_button_title(app, state)
+    menubar_title._set_button_title(app, state)
+
+    assert plain == ["50% · 40% · 30%"]
+    assert len(drawn) == 2
+    assert drawn[0] == [
+        (menubar_chrome._claude_menubar_icon, "50%"),
+        (menubar_chrome._codex_menubar_icon, "40%"),
+        (menubar_chrome._agy_menubar_icon, "30%"),
+    ]
+    assert drawn[1] == [
+        (menubar_chrome._claude_menubar_icon, "50%"),
+        (menubar_chrome._codex_menubar_icon, "40%"),
+        (menubar_chrome._grok_menubar_icon, "30%"),
+    ]
+
+
+@pytest.mark.parametrize("has_backup", [False, True])
+def test_external_statusline_toggle_installs_without_losing_backup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, has_backup: bool
+) -> None:
+    from installer import setup_hook
+
+    settings_path = tmp_path / "settings.json"
+    external = {"type": "command", "command": "custom-command"}
+    backup = {"type": "command", "command": "older-command"}
+    settings: dict[str, Any] = {"statusLine": external}
+    if has_backup:
+        settings["usage"] = {"previousStatusLine": backup}
+    settings_path.write_text(json.dumps(settings), encoding="utf-8")
+    monkeypatch.setattr(statusline_settings, "_claude_settings_path", lambda: settings_path)
+    monkeypatch.setattr(setup_hook, "_claude_settings_path", lambda: settings_path)
+    monkeypatch.setattr(statusline_settings, "_sync_agy_statusline", lambda enable: None)
+    monkeypatch.setattr(statusline_settings, "_sync_grok_statusline", lambda enable: None)
+    monkeypatch.setattr(setup_hook, "is_agy_setup", lambda: False)
+    monkeypatch.setattr(setup_hook, "_copy_hook_script", lambda: None)
+    monkeypatch.setattr(setup_hook, "_copy_forwarder_script", lambda: None)
+    calls = []
+
+    def install() -> int:
+        calls.append("install")
+        setup_hook._install_forwarder(setup_hook._load_settings())
+        return 0
+
+    monkeypatch.setattr(setup_hook, "setup", install)
+    assert statusline_settings._toggle_statusline_settings() == ("install", 0)
+    assert calls == ["install"]
+    saved = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert saved["usage"]["previousStatusLine"] == (backup if has_backup else external)
+    assert setup_hook._detect_current_state(saved) == "us-forwarder"
+    assert statusline_settings._statusline_enabled() is True
+
+
+@pytest.mark.parametrize("action", ["install", "toggle", "uninstall"])
+@pytest.mark.parametrize("code", [0, 1])
+def test_statusline_action_reports_return_code(
+    monkeypatch: pytest.MonkeyPatch, action: str, code: int
+) -> None:
+    results = []
+    delegate = SimpleNamespace(
+        performSelectorOnMainThread_withObject_waitUntilDone_=lambda *args: results.append(args)
+    )
+    monkeypatch.setattr(menubar_actions, "_enable_statusline_settings", lambda: code)
+    monkeypatch.setattr(menubar_actions, "_disable_statusline_settings", lambda: code)
+    monkeypatch.setattr(menubar_actions, "_toggle_statusline_settings", lambda: ("install", code))
+    menubar_actions.statusline_action_in_background(delegate, action)
+    assert results[0][0] == "_finishStatuslineAction:"
+    assert results[0][1]["ok"] is (code == 0)
+
+
+def test_statusline_failure_shows_existing_alert(monkeypatch: pytest.MonkeyPatch) -> None:
+    messages: list[str] = []
+    alert = SimpleNamespace(
+        setMessageText_=messages.append,
+        setInformativeText_=lambda text: None,
+        runModal=lambda: messages.append("shown"),
+    )
+    monkeypatch.setattr(menubar, "_make_alert", lambda: alert)
+    delegate = menubar.AppDelegate.alloc().init()
+    delegate.language = "zh-TW"
+    monkeypatch.setattr(delegate, "_refresh", lambda: None)
+    menubar.AppDelegate._finishStatuslineAction_(
+        delegate, {"ok": False, "action": "install", "output": ""}
+    )
+    assert messages == [_t("zh-TW", "statusline_action_failed"), "shown"]
+
+
+def test_launch_at_login_failure_shows_alert_and_keeps_plist(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import subprocess
+
+    from installer import login_item
+
+    plist = tmp_path / "LaunchAgents" / "usage.plist"
+    monkeypatch.setattr(login_item, "PLIST_PATH", plist)
+    monkeypatch.setattr(login_item, "_LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(login_item, "_plist_text", lambda: "plist")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 5, stderr="permission denied"),
+    )
+    messages: list[str] = []
+    alert = SimpleNamespace(
+        setMessageText_=messages.append, runModal=lambda: messages.append("shown")
+    )
+    monkeypatch.setattr(menubar_actions, "_make_alert", lambda: alert)
+    delegate = menubar.AppDelegate.alloc().init()
+    delegate.language = "zh-TW"
+    monkeypatch.setattr(delegate, "_mark_switch_menu_action", lambda: None)
+    menubar.AppDelegate.toggleLaunchAtLogin_(delegate, None)
+    assert messages == [_t("zh-TW", "launch_at_login_failed", error="permission denied"), "shown"]
+    assert plist.read_text(encoding="utf-8") == "plist"
+    assert login_item.is_enabled() is True

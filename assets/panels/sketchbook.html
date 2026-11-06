@@ -54,7 +54,7 @@
     .card[data-card="grok"] .brand-icon { background: #eae7f1; }
     .card[data-card="projects"] .brand-icon { background: #d9f5e1; }
     .brand-icon svg { width: 19px; height: 19px; }
-    .brand h1 { flex: 1; min-width: 0; margin: 0; font-size: 17px; line-height: 1.15; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .brand h1 { flex: 1; min-width: 0; margin: 0; font-size: 17px; line-height: 1.15; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-block: 0.2em; margin-block: -0.2em; }
     .card[data-card="agy"] .brand h1 { flex: none; }
     .card[data-card="codex"] .brand.usage-switch-host h1 { flex: none; }
     .codex-stale { display: inline-flex; align-items: center; gap: 3px; min-width: 0; color: #806016; font-size: 10px; white-space: nowrap; }
@@ -146,6 +146,11 @@
     html.compact-cards body .card[data-card] .brand :is(img, .brand-icon) {
       border-radius: 9px 11px 8px 12px / 11px 8px 12px 9px;
     }
+
+    /* Codex has no live report, so an old reading is normal, not a warning. */
+    [data-codex-stale] {
+      color: var(--muted);
+    }
   </style>
 </head>
 <body>
@@ -166,7 +171,6 @@
         <img src="{{CODEX_ICON}}" alt="">
         <h1 data-i18n="codex_name">Codex</h1>
         <div class="codex-stale" data-codex-stale hidden>
-          <span aria-hidden="true">⚠</span>
           <span data-codex-stale-age></span>
           <span class="codex-stale-info" aria-hidden="true">ⓘ
             <span class="codex-stale-tooltip" data-codex-stale-tooltip></span>

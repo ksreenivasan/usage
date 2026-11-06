@@ -128,6 +128,9 @@
       font-size: 13px;
       line-height: 1.2;
       font-weight: 700;
+      /* Room for descenders (g, y) inside the ellipsis clip; the negative margin keeps the layout unchanged. */
+      padding-block: 0.2em;
+      margin-block: -0.2em;
     }
 
     .card[data-card="projects"] .brand {
@@ -613,6 +616,11 @@
       background: var(--panel-light);
       padding: 2px 4px;
     }
+
+    /* Codex has no live report, so an old reading is normal, not a warning. */
+    [data-codex-stale] {
+      color: var(--muted);
+    }
   </style>
 </head>
 <body>
@@ -632,7 +640,6 @@
         <img src="{{CODEX_ICON}}" alt="">
         <h1 data-i18n="codex_name">Codex</h1>
         <div class="codex-stale" data-codex-stale hidden>
-          <span aria-hidden="true">⚠</span>
           <span data-codex-stale-age></span>
           <span class="codex-stale-info" aria-hidden="true">ⓘ
             <span class="codex-stale-tooltip" data-codex-stale-tooltip></span>

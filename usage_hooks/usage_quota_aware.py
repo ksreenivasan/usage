@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-__version__ = "1.3"
+__version__ = "1.5"
 CLAUDE_STATUS = Path.home() / ".claude/usage-status.json"
 QUOTA_SNAPSHOT = Path.home() / ".usage/quota_snapshot.json"
 STATE_PATH = Path.home() / ".usage/quota_aware_state.json"
@@ -41,12 +41,21 @@ def _generated_at(value: Any) -> float:
     return parsed.timestamp()
 
 
-def _windows(now: float) -> list[tuple[str, str, float, float]]:
-    windows: list[tuple[str, str, float, float]] = []
+def _windows(session_id: str, now: float) -> list[tuple[str, str, float, float, str]]:
+    windows: list[tuple[str, str, float, float, str]] = []
 
-    def add(tool: str, data: Any, *, claude: bool = False, generated: float = 0) -> None:
+    def add(
+        tool: str, data: Any, *, claude: bool = False, generated: float = 0, updated_at: Any = None
+    ) -> None:
         if not isinstance(data, dict):
             return
+        suffix = ""
+        try:
+            age = now - _generated_at(updated_at)
+            if age >= 3600:
+                suffix = f" (last updated {int(age // 3600)}h ago; it may have reset since)"
+        except (ValueError, OverflowError):
+            pass
         for name in ("five_hour", "seven_day"):
             window = data.get(name)
             if not isinstance(window, dict):
@@ -58,9 +67,13 @@ def _windows(now: float) -> list[tuple[str, str, float, float]]:
                 if remaining is not None:
                     reset = generated + remaining
             if used is not None and reset is not None and reset > now:
-                windows.append((tool, name, used, reset))
+                windows.append((tool, name, used, reset, suffix))
 
-    add("Claude Code", _read(CLAUDE_STATUS).get("rate_limits"), claude=True)
+    status = _read(CLAUDE_STATUS)
+    # A session that has not replied yet carries the previous session's windows, which can
+    # be another account's after a /login switch. Older status line hooks omit the field.
+    if status.get("_rate_limits_session_id", session_id) == session_id:
+        add("Claude Code", status.get("rate_limits"), claude=True)
     snapshot = _read(QUOTA_SNAPSHOT)
     try:
         generated = _generated_at(snapshot.get("generated_at"))
@@ -73,15 +86,20 @@ def _windows(now: float) -> list[tuple[str, str, float, float]]:
         return windows
     codex = agents.get("codex")
     if isinstance(codex, dict) and codex.get("available"):
-        add("Codex", codex)
+        add("Codex", codex, updated_at=codex.get("updated_at"))
     muse = agents.get("muse")
     if isinstance(muse, dict) and muse.get("available"):
-        add("Muse", muse)
+        add("Muse", muse, updated_at=muse.get("updated_at"))
     agy = agents.get("antigravity")
     if isinstance(agy, dict) and agy.get("available") and isinstance(agy.get("groups"), list):
         for group in agy["groups"]:
             if isinstance(group, dict) and isinstance(group.get("name"), str):
-                add("Antigravity (" + group["name"] + ")", group, generated=generated)
+                add(
+                    "Antigravity (" + group["name"] + ")",
+                    group,
+                    generated=generated,
+                    updated_at=agy.get("updated_at"),
+                )
     return windows
 
 
@@ -116,16 +134,18 @@ def reminder(session_id: str, now: float) -> str:
     }
     messages = []
     limited = set()
-    windows = _windows(now)
-    for tool, window, used, reset in windows:
+    windows = _windows(session_id, now)
+    for tool, window, used, reset, suffix in windows:
         thresholds = (80, 90, 95) if window == "five_hour" else (95,)
         level = max((threshold for threshold in thresholds if used >= threshold), default=0)
         if level:
             limited.add(tool)
-        # Antigravity's reset is derived from whole-second fields and can drift by a second
-        # between snapshots; key on the minute so the same window is not announced twice.
-        key = json.dumps([session_id, tool, window, round(reset / 60)])
-        if not level or level <= state.get(key, {}).get("level", 0):
+        # Antigravity's reset is derived from a seconds countdown and drifts by up to about a
+        # minute between snapshots, so a reset within 10 minutes is the same window.
+        key = json.dumps([session_id, tool, window])
+        seen = state.get(key, {})
+        announced = seen.get("level", 0) if abs(seen.get("resets_at", 0) - reset) < 600 else 0
+        if not level or level <= announced:
             continue
         label = "5-hour" if window == "five_hour" else "weekly"
         usage = _usage(used, reset, now)
@@ -138,6 +158,7 @@ def reminder(session_id: str, now: float) -> str:
         else:
             scope = "work run in Claude Code" if tool == "Claude Code" else f"work sent to {tool}"
             messages.append(f"{tool} {label} quota: {usage}. Only limits {scope}.")
+        messages[-1] += suffix
         state[key] = {"resets_at": reset, "level": level}
     if not messages:
         return ""
@@ -145,7 +166,7 @@ def reminder(session_id: str, now: float) -> str:
     # A spent agy model group reads as "Antigravity is used up" unless the groups that
     # still have quota are named next to it.
     open_groups: dict[str, float] = {}
-    for tool, _window, used, _reset in windows:
+    for tool, _window, used, _reset, _suffix in windows:
         if tool.startswith("Antigravity (") and tool not in limited:
             group = tool[len("Antigravity (") : -1]
             open_groups[group] = max(used, open_groups.get(group, 0.0))
@@ -157,7 +178,7 @@ def reminder(session_id: str, now: float) -> str:
         )
     own = {
         window: _usage(used, reset, now)
-        for tool, window, used, reset in windows
+        for tool, window, used, reset, _suffix in windows
         if tool == "Claude Code"
     }
     own_status = (

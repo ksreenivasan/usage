@@ -16,7 +16,7 @@ from typing import Any, Protocol
 
 from Foundation import NSObject
 
-from installer import session_hooks, setup_hook
+from installer import login_item, session_hooks, setup_hook
 from installer.statusline_settings import (
     _disable_statusline_settings,
     _enable_statusline_settings,
@@ -129,11 +129,12 @@ def statusline_action_in_background(app: _ActionApp, action: str) -> None:
     try:
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
             if action == "toggle":
-                _toggle_statusline_settings()
+                _, exit_code = _toggle_statusline_settings()
             elif action == "uninstall":
-                _disable_statusline_settings()
+                exit_code = _disable_statusline_settings()
             else:
-                _enable_statusline_settings()
+                exit_code = _enable_statusline_settings()
+            ok = exit_code == 0
     except SystemExit as exc:
         if exc.code:
             ok = False
@@ -177,7 +178,7 @@ def show_forwarder_mode_prompt_if_needed(language: str | None = None) -> None:
         )
         if dismissed or setup_hook._detect_current_state(settings) != "external":
             return
-    except Exception:
+    except (Exception, SystemExit):
         if os.environ.get("USAGE_DEBUG") == "1":
             logger.warning("forwarder prompt check failed", exc_info=True)
         return
@@ -194,13 +195,13 @@ def show_forwarder_mode_prompt_if_needed(language: str | None = None) -> None:
         if result == 1000:
             setup_hook.setup(force_forwarder=True)
             session_hooks._migrate_bundled_python_commands_if_needed()
-    except Exception:
+    except (Exception, SystemExit):
         if os.environ.get("USAGE_DEBUG") == "1":
             logger.warning("forwarder setup failed", exc_info=True)
     finally:
         try:
             _set_forwarder_mode_prompt_dismissed()
-        except Exception:
+        except (Exception, SystemExit):
             if os.environ.get("USAGE_DEBUG") == "1":
                 logger.warning("forwarder prompt dismissal failed", exc_info=True)
 
@@ -331,3 +332,18 @@ class QuotaAwareMenuTarget(NSObject):  # type: ignore[misc]
             alert.setInformativeText_(str(result.get("output") or ""))
         alert.runModal()
         self.app._refresh()
+
+
+def toggle_launch_at_login(app: Any) -> None:
+    app._mark_switch_menu_action()
+    try:
+        if login_item.is_enabled():
+            login_item.disable()
+        else:
+            login_item.enable()
+    except Exception as exc:
+        if os.environ.get("USAGE_DEBUG") == "1":
+            logger.warning("toggle launch at login failed", exc_info=True)
+        alert = _make_alert()
+        alert.setMessageText_(_t(app.language, "launch_at_login_failed", error=str(exc)))
+        alert.runModal()

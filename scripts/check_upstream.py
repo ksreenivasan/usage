@@ -50,6 +50,7 @@ KNOWN_STATUS = frozenset(
         "cwd",
         "scratchpad_dir",
         "prompt_id",
+        "pr",
         "effort",
         "session_name",
         "model",
@@ -529,6 +530,7 @@ def hook_pairs() -> list[tuple[Path, Path]]:
             ("usage_terse_mode.py", session_hooks.TERSE_HOOK_TARGET),
             ("usage_terse_mode.py", session_hooks.CODEX_TERSE_HOOK_TARGET),
             ("usage_terse_reminder.py", session_hooks.TERSE_REMINDER_HOOK_TARGET),
+            ("usage_quota_aware.py", session_hooks.QUOTA_AWARE_HOOK_TARGET),
         )
     ]
 

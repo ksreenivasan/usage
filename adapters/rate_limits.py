@@ -36,7 +36,8 @@ def _read_status() -> dict[str, Any] | None:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data: dict[str, Any] = json.load(f)
-                return data
+                if isinstance(data, dict):
+                    return data
         except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             continue
     return None
@@ -44,16 +45,16 @@ def _read_status() -> dict[str, Any] | None:
 
 def load_rate_limits() -> RateLimits | None:
     data = _read_status()
-    if data is None or not usage_client._has_complete_rate_limits(data):
+    if data is None or not usage_client._has_rate_limits(data):
         snapshot = usage_client.read_quota_fallback()
         if snapshot is not None:
             return _snapshot_rate_limits(snapshot)
         if data is None:
             return None
 
-    rl = data.get("rate_limits") or {}
-    five = rl.get("five_hour") or {}
-    seven = rl.get("seven_day") or {}
+    rl = usage_client._as_dict(data.get("rate_limits"))
+    five = usage_client._as_dict(rl.get("five_hour"))
+    seven = usage_client._as_dict(rl.get("seven_day"))
 
     now_ts = datetime.now(timezone.utc).timestamp()
     five_pct = _as_finite_float(five.get("used_percentage"))

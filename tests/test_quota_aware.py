@@ -120,6 +120,50 @@ def test_snapshot_and_agy_reset(paths: Path) -> None:
     assert hook.reminder("one", NOW) == ""
 
 
+@pytest.mark.parametrize("tool", ["codex", "muse", "antigravity"])
+@pytest.mark.parametrize(
+    ("updated_at", "hours"),
+    [
+        (datetime.fromtimestamp(NOW - 172800, UTC).isoformat(), 48),
+        (datetime.fromtimestamp(NOW - 3600, UTC).isoformat(), 1),
+        (datetime.fromtimestamp(NOW - 600, UTC).isoformat(), None),
+        (None, None),
+        ("invalid", None),
+        ("2026-01-01T00:00:00", None),
+    ],
+)
+def test_per_tool_observation_age(
+    paths: Path, tool: str, updated_at: str | None, hours: int | None
+) -> None:
+    snapshot()
+    data = json.loads(hook.QUOTA_SNAPSHOT.read_text())
+    agent: dict[str, Any] = {
+        "available": True,
+        "age_seconds": 0,
+        "seven_day": {"used_percent": 96, "resets_at": RESET},
+    }
+    if updated_at is not None:
+        agent["updated_at"] = updated_at
+    if tool == "antigravity":
+        agent["groups"] = [{"name": "Gemini", "seven_day": agent.pop("seven_day")}]
+        agent["groups"][0]["updated_at"] = datetime.fromtimestamp(NOW, UTC).isoformat()
+    data["agents"] = {tool: agent}
+    hook.QUOTA_SNAPSHOT.write_text(json.dumps(data))
+    claude(96)
+
+    output = hook.reminder("one", NOW)
+    line = next(line for line in output.splitlines() if "weekly quota: 96%" in line)
+    if hours is None:
+        assert "last updated" not in output
+    else:
+        assert line.endswith(f" (last updated {hours}h ago; it may have reset since)")
+        assert output.count("last updated") == 1
+    assert "last updated" not in next(
+        line for line in output.splitlines() if "Claude Code 5-hour quota" in line
+    )
+    assert hook.reminder("one", NOW) == ""
+
+
 def agy_weekly() -> None:
     snapshot()
     data = json.loads(hook.QUOTA_SNAPSHOT.read_text())
@@ -308,6 +352,9 @@ def test_install_remove_and_upgrade(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     target.write_text('__version__ = "0.1"')
     session_hooks._self_heal_quota_aware()
     assert session_hooks._installed_quota_aware_version() == session_hooks.QUOTA_AWARE_HOOK_VERSION
+    target.write_text('__version__ = "99.0"')
+    session_hooks._self_heal_quota_aware()
+    assert session_hooks._installed_quota_aware_version() == "99.0"
     target.unlink()
     session_hooks._self_heal_quota_aware()
     assert target.exists()
@@ -404,3 +451,23 @@ def test_muse_reminder_ignores_unavailable_expired_stale(
     }
     hook.QUOTA_SNAPSHOT.write_text(json.dumps(data))
     assert hook.reminder("muse", NOW) == ""
+
+
+def test_quota_carried_from_another_session_is_not_this_accounts(paths: Path) -> None:
+    claude(95, 99)
+    status = json.loads(hook.CLAUDE_STATUS.read_text())
+    status["_rate_limits_session_id"] = "before-login-switch"
+    hook.CLAUDE_STATUS.write_text(json.dumps(status))
+    assert hook.reminder("one", NOW) == ""
+    status["_rate_limits_session_id"] = "one"
+    hook.CLAUDE_STATUS.write_text(json.dumps(status))
+    assert "Claude Code 5-hour quota: 95% used" in hook.reminder("one", NOW)
+
+
+def test_reset_drift_within_a_window_is_announced_once(paths: Path) -> None:
+    claude(91, reset=NOW + 4800 - 31)
+    assert "91% used" in hook.reminder("one", NOW)
+    claude(91, reset=NOW + 4800 + 29)
+    assert hook.reminder("one", NOW) == ""
+    claude(91, reset=NOW + 4800 + 3600)
+    assert "91% used" in hook.reminder("one", NOW)

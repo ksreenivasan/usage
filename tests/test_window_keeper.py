@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -14,6 +15,7 @@ from typing import Any
 import pytest
 
 import quota.window_keeper as window_keeper
+from loaders import claude_usage
 
 
 def test_run_claude_ping_skips_user_hooks(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -399,8 +401,83 @@ def test_maybe_ping_skips_when_window_still_running(
     )
 
     assert calls == []
+    assert json.loads(isolated_state.read_text()) == {"last_seen_reset_at": now + 3600}
+    assert _SyncThread.instances == []
+
+
+def test_maybe_ping_recalls_window_dropped_after_expiry(
+    monkeypatch: pytest.MonkeyPatch, isolated_state: Path
+) -> None:
+    # Claude Code stops sending five_hour once it expires; the hook drops the
+    # cached copy, so the reader reports no window at all.
+    calls = _arm_successful_ping(monkeypatch)
+    now = time.time()
+    reset_at = now + EXPIRED
+    isolated_state.write_text(json.dumps({"last_seen_reset_at": reset_at}))
+    # The reader stamps a missing reset with parse time.
+    window_keeper.maybe_ping(
+        current_reset_at=time.time(), current_percent=None, data_source="hook", mock=False
+    )
+
+    assert calls == ["/fake/claude"]
+    assert window_keeper._load_ping_state()[0] == reset_at
+
+
+def test_maybe_ping_never_reported_window_stays_unarmed(
+    monkeypatch: pytest.MonkeyPatch, isolated_state: Path
+) -> None:
+    # Plans without a 5-hour limit never report a reset to remember.
+    calls = _arm_successful_ping(monkeypatch)
+    # The reader stamps a missing reset with parse time.
+    window_keeper.maybe_ping(
+        current_reset_at=time.time(), current_percent=None, data_source="hook", mock=False
+    )
+
+    assert calls == []
     assert isolated_state.exists() is False
     assert _SyncThread.instances == []
+
+
+@pytest.mark.parametrize(
+    "reset_fields",
+    [
+        {},
+        {"resets_at": None},
+        {"resets_at": "invalid"},
+        {"resets_at": float("nan")},
+        {"resets_at": float("inf")},
+    ],
+)
+def test_missing_original_reset_never_arms_keeper(
+    monkeypatch: pytest.MonkeyPatch, isolated_state: Path, reset_fields: dict[str, object]
+) -> None:
+    calls = _arm_successful_ping(monkeypatch)
+    now = 1_800_000_000.0
+    monkeypatch.setattr(time, "time", lambda: now)
+    snapshot = claude_usage._build_snapshot(
+        {"rate_limits": {"five_hour": {"used_percentage": 25, **reset_fields}}}
+    )
+    assert snapshot is not None
+    assert snapshot.current_percent == 25
+    assert snapshot.current_reset_at is None
+    window_keeper.maybe_ping(
+        snapshot.current_reset_at, snapshot.current_percent, snapshot.data_source, False
+    )
+    assert not isolated_state.exists()
+
+    monkeypatch.setattr(time, "time", lambda: now + 180)
+    absent = claude_usage._build_snapshot(
+        {"rate_limits": {"seven_day": {"used_percentage": 20, "resets_at": now + 86400}}}
+    )
+    assert absent is not None
+    reset_at, percent = window_keeper._recall_expired_window(
+        {}, absent.current_reset_at, absent.current_percent, absent.data_source
+    )
+    assert not window_keeper.should_ping(now + 180, reset_at, True, None, None, percent, "hook")
+    window_keeper.maybe_ping(reset_at, percent, "hook", False)
+    assert calls == []
+    assert _SyncThread.instances == []
+    assert not isolated_state.exists()
 
 
 def test_maybe_ping_deduplicates_same_boundary(
@@ -520,3 +597,22 @@ def test_maybe_ping_ignores_non_hook_source(
     assert calls == []
     assert isolated_state.exists() is False
     assert _SyncThread.instances == []
+
+
+_original_nvm_lookup = window_keeper._resolve_claude_bin
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Unix version managers")
+def test_window_keeper_finds_nvm_cli(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setattr("shutil.which", lambda _: None)
+    binary = tmp_path / ".nvm/versions/node/v22.3.0/bin/claude"
+    binary.parent.mkdir(parents=True)
+    binary.touch()
+    binary.chmod(0o755)
+    original_isfile = os.path.isfile
+    monkeypatch.setattr(
+        os.path, "isfile", lambda path: str(path) == str(binary) and original_isfile(path)
+    )
+    assert _original_nvm_lookup() == str(binary)

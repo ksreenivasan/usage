@@ -32,7 +32,6 @@ from AppKit import (
 from Foundation import NSObject, NSRunLoop, NSRunLoopCommonModes, NSTimer
 
 import panels
-from installer import login_item
 from installer.statusline_settings import (
     _claude_settings_path as _claude_settings_path,
 )
@@ -189,7 +188,6 @@ __all__ = [
 ]
 
 UPDATE_ALERT_BODY_LIMIT = 2000
-SLOW_POLL_INTERVAL_S = 300.0
 
 logger = logging.getLogger(__name__)
 
@@ -246,6 +244,7 @@ class AppDelegate(NSObject):
     _history_source_tracker = objc.ivar()
     _history_load_error_key = objc.ivar()
     _quota_notifier = objc.ivar()
+    _notification_authorization_status = objc.ivar()
     _switch_menu_action_taken = objc.ivar()
     _usage_client = objc.ivar()
     language = objc.ivar()
@@ -293,6 +292,7 @@ class AppDelegate(NSObject):
         return self
 
     def applicationDidFinishLaunching_(self, notification: Any) -> None:
+        menubar_notify.refresh_notification_permission(self)
         NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
         self.status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(
             NSVariableStatusItemLength,
@@ -317,7 +317,7 @@ class AppDelegate(NSObject):
 
         self._request_notification_authorization()
         self._refresh()
-        self._reschedule_poll_timer(max(self.interval, SLOW_POLL_INTERVAL_S))
+        self._reschedule_poll_timer(menubar_title.menubar_poll_interval(self, self.latest_state))
         self._fs_stream = setup_fsevents(self)
         self._history_source_tracker.set_incremental_enabled(self._fs_stream is not None)
         warm_up_pricing(self._refresh_after_pricing_warm_up)
@@ -378,7 +378,7 @@ class AppDelegate(NSObject):
 
     def _panel_window_did_hide(self) -> None:
         self.popover_controller.evictInactivePanelViews()
-        self._reschedule_poll_timer(max(self.interval, SLOW_POLL_INTERVAL_S))
+        self._reschedule_poll_timer(menubar_title.menubar_poll_interval(self, self.latest_state))
 
     def windowDidMove_(self, notification: Any) -> None:
         if notification.object() is self.popover and self._panel_window_is_visible():
@@ -463,15 +463,7 @@ class AppDelegate(NSObject):
         webbrowser.open("https://aqua5230.github.io/ai-updates/")
 
     def toggleLaunchAtLogin_(self, sender: Any) -> None:
-        self._mark_switch_menu_action()
-        try:
-            if login_item.is_enabled():
-                login_item.disable()
-            else:
-                login_item.enable()
-        except Exception:
-            if os.environ.get("USAGE_DEBUG") == "1":
-                logger.warning("toggle launch at login failed", exc_info=True)
+        menubar_actions.toggle_launch_at_login(self)
 
     def _toggle_hide_section(
         self,
@@ -507,6 +499,12 @@ class AppDelegate(NSObject):
 
     def toggleHideMuse_(self, sender: Any) -> None:
         self._toggle_hide_section(sender, "hide_muse_section", "hide_muse", _hide_muse_enabled)
+
+    def selectQuotaThreshold_(self, sender: Any) -> None:
+        menubar_menu.select_quota_threshold(self, sender)
+
+    def openNotificationSettings_(self, sender: Any) -> None:
+        menubar_notify.open_notification_settings(self)
 
     def toggleQuotaNotifications_(self, sender: Any) -> None:
         self._mark_switch_menu_action()
