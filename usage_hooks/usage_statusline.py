@@ -344,7 +344,17 @@ C = {
 # A separator only marks a break; it should not compete with the numbers.
 SEP = f" {C['grey']}|{C['reset']} "
 WINDOW_SEP = f" {C['grey']}·{C['reset']} "
-ACCOUNT_HIGHLIGHT = "\033[1;7m"
+# Fork: the two accounts differ by brightness, not hue. Reds and greys that would be hard
+# to read on the fill get a lighter stand-in there; dim is dropped so the block stays bright.
+ACTIVE_FILL = "\033[48;5;238m"
+INACTIVE_GREY = "\033[38;5;243m"
+FILL_RED = "\033[38;5;210m"
+ON_FILL = (
+    (C["dim"], ""),
+    (C["grey"], "\033[38;5;250m"),
+    (C["red"], FILL_RED),
+    ("\033[38;5;160m", FILL_RED),
+)
 
 
 def _windows_system_lang() -> str:
@@ -1054,21 +1064,35 @@ def _other_account_parts(now: datetime, bar_w: int) -> List[Tuple[str, str, str]
         pct = _as_float(entry.get("used_percentage"))
         if pct is None:
             continue
-        reset = ""
+        left = ""
         resets_at = _as_float(entry.get("resets_at"))
         if resets_at is not None:
             remain = int(resets_at) - int(now.timestamp())
             if remain > 0:
-                left = f"{fmt_duration(remain)} {_t('remaining_prefix')}"
-                reset = f" {C['dim']}{left}{C['reset']}"
+                left = fmt_duration(remain)
             else:
                 pct = 0.0
-        name = f"{C['dim']}{label}:{C['reset']}"
-        bar = progress_bar(pct, bar_w, color_func=lambda _pct: C["dim"])
+        name = f"{INACTIVE_GREY}{label}:{C['reset']}"
+        bar = progress_bar(pct, bar_w, color_func=lambda _pct: INACTIVE_GREY)
+        short_left = f" {left}" if left else ""
+        long_left = f"{short_left} {_t('remaining_prefix')}" if left else ""
+        plain = f"{pct:.0f}%"
         parts.append(
-            (f"{name}{bar}{reset}", f"{name}{bar}", f"{name}{C['dim']}{pct:.0f}%{C['reset']}")
+            (
+                f"{name}{bar}{INACTIVE_GREY}{long_left}{C['reset']}",
+                f"{name}{INACTIVE_GREY}{plain}{long_left}{C['reset']}",
+                f"{name}{INACTIVE_GREY}{plain}{short_left}{C['reset']}",
+            )
         )
     return parts
+
+
+def _on_fill(text: str) -> str:
+    """Put a whole block on ACTIVE_FILL. A color's reset also clears the fill, so restore it."""
+    for color, legible in ON_FILL:
+        text = text.replace(color, legible)
+    text = text.replace(C["reset"], C["reset"] + ACTIVE_FILL)
+    return f"{ACTIVE_FILL} {text} {C['reset']}"
 
 
 def _two_account_line(
@@ -1077,13 +1101,14 @@ def _two_account_line(
     other: List[Tuple[str, str, str]],
     width: int,
 ) -> List[str]:
-    """Both accounts side by side in the widest form that fits; the active one is highlighted."""
-    highlighted = f"{ACCOUNT_HIGHLIGHT} {ACTIVE_ACCOUNT} {C['reset']}"
-    dimmed = f"{C['dim']}{OTHER_ACCOUNT}{C['reset']}"
+    """Both accounts side by side in the widest form that fits, the active one on a fill."""
+    active_name = f"\033[1m{ACTIVE_ACCOUNT}{C['reset']}"
+    other_name = f"{INACTIVE_GREY}{OTHER_ACCOUNT}{C['reset']}"
     line = base
     for active_form, other_form in ((0, 0), (0, 1), (0, 2), (1, 2), (2, 2)):
-        ours = " ".join([highlighted, WINDOW_SEP.join(p[active_form] for p in active)]).rstrip()
-        theirs = " ".join([dimmed, WINDOW_SEP.join(p[other_form] for p in other)])
+        ours = " ".join([active_name, WINDOW_SEP.join(p[active_form] for p in active)])
+        ours = _on_fill(ours.rstrip())
+        theirs = " ".join([other_name, WINDOW_SEP.join(p[other_form] for p in other)])
         # Fixed sides, so only the highlight moves between sessions.
         line = base + ([ours, theirs] if ACTIVE_ACCOUNT == "work" else [theirs, ours])
         if vlen(SEP.join(line)) <= width:

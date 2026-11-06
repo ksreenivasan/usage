@@ -1753,8 +1753,8 @@ def test_render_shows_both_accounts_and_highlights_the_active_one(
     output = usage_statusline.render(_two_account_payload(), TWO_ACCOUNT_NOW)
     first_line = output.splitlines()[0]
 
-    assert f"{usage_statusline.ACCOUNT_HIGHLIGHT} work " in first_line
-    assert f"{usage_statusline.C['dim']}personal" in first_line
+    assert f"{usage_statusline.ACTIVE_FILL} \033[1mwork" in first_line
+    assert f"{usage_statusline.INACTIVE_GREY}personal" in first_line
     plain = _plain(first_line)
     assert plain.index("work") < plain.index("40%") < plain.index("personal") < plain.index("4%")
     assert "personal 7d:" in plain
@@ -1774,7 +1774,7 @@ def test_render_keeps_sides_fixed_when_personal_is_active(
 
     first_line = usage_statusline.render(payload, TWO_ACCOUNT_NOW).splitlines()[0]
 
-    assert f"{usage_statusline.ACCOUNT_HIGHLIGHT} personal " in first_line
+    assert f"{usage_statusline.ACTIVE_FILL} \033[1mpersonal" in first_line
     plain = _plain(first_line)
     assert plain.index("work") < plain.index("100%") < plain.index("personal") < plain.index("4%")
 
@@ -1829,7 +1829,57 @@ def test_render_is_single_account_without_usable_other_data(
     assert "work" not in baseline
 
 
-@pytest.mark.parametrize("width", [150, 110, 90, 70, 58])
+def test_fill_covers_every_visible_character_of_the_active_block() -> None:
+    colors = usage_statusline.C
+    bar = usage_statusline.progress_bar(90, 8)
+    block = usage_statusline._on_fill(f"name {colors['blue']}5h:{colors['reset']}{bar} rest")
+
+    filled = False
+    outside = ""
+    for chunk in re.split(r"(\033\[[0-9;]*m)", block):
+        if chunk == usage_statusline.ACTIVE_FILL:
+            filled = True
+        elif chunk == colors["reset"]:
+            filled = False
+        elif not chunk.startswith("\033") and not filled:
+            outside += chunk
+
+    assert outside == ""
+    assert block.endswith(colors["reset"])
+
+
+def test_fill_replaces_colors_that_are_hard_to_read_on_it() -> None:
+    colors = usage_statusline.C
+    bar = usage_statusline.progress_bar(90, 8)
+    block = usage_statusline._on_fill(
+        f"{colors['dim']}{colors['red']}{colors['grey']}x{colors['reset']}{bar}"
+    )
+
+    for color in (colors["dim"], colors["red"], colors["grey"], "\033[38;5;160m"):
+        assert color not in block
+
+
+def test_other_account_block_uses_only_grey(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _seed_other_account(
+        monkeypatch,
+        tmp_path,
+        {"five_hour": {"used_percentage": 100, "resets_at": TWO_ACCOUNT_RESET}},
+    )
+
+    parts = usage_statusline._other_account_parts(TWO_ACCOUNT_NOW, 8)
+    allowed = {
+        usage_statusline.INACTIVE_GREY,
+        usage_statusline.C["grey"],
+        usage_statusline.C["reset"],
+    }
+
+    for form in parts[0]:
+        assert set(re.findall(r"\033\[[0-9;]*m", form)) <= allowed
+
+
+@pytest.mark.parametrize("width", [150, 110, 90, 70, 62])
 def test_render_two_accounts_narrows_to_fit(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, width: int
 ) -> None:
@@ -1847,4 +1897,5 @@ def test_render_two_accounts_narrows_to_fit(
 
     assert usage_statusline.vlen(first_line) <= width
     assert "work" in first_line
-    assert "personal" in first_line
+    other_block = _plain(first_line).split("personal", 1)[1]
+    assert other_block.count("2h0m") == 2
