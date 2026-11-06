@@ -21,7 +21,13 @@ render (`read_mix`: up to 4 MiB, cached under `~/.usage/claude-pane/mix/`).
   unused, to keep merges small.
 - `git_branch()` now reads `.git` and `HEAD` only if they are regular files, and at most 4 KiB. Before this, a
   FIFO or a symlink to `/dev/zero` in the working directory could hang the render or exhaust its memory.
-- Added tests for both changes in `tests/test_usage_statusline.py`.
+- Shows both accounts side by side, `work` then `personal`, with the active one highlighted. `claude-personal`
+  already runs this script with `HOME=~/.claude-personal/statusline-home` (from its `overrides.json`), so each
+  account writes its own `usage-status.json`. The script tells which account it is from `HOME` and reads the
+  other account's file. That is the only file it reads from outside its `HOME`. With no such file it renders one
+  account, unchanged. The other account's numbers are from its last render on this host.
+- Added tests for these changes in `tests/test_usage_statusline.py`, and a `tests/conftest.py` fixture that keeps
+  the real other-account file out of test runs.
 
 The status line has to stay stdlib-only and run under macOS `/usr/bin/python3` 3.9 (see `CLAUDE.md`).
 

@@ -32,6 +32,13 @@ collect_ignore = (
 
 
 @pytest.fixture(autouse=True)
+def _isolate_other_account(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from usage_hooks import usage_statusline
+
+    monkeypatch.setattr(usage_statusline, "OTHER_STATUS_FILE", str(tmp_path / "no-other-account"))
+
+
+@pytest.fixture(autouse=True)
 def _isolate_desktop_quota(monkeypatch: pytest.MonkeyPatch) -> None:
     from loaders import claude_desktop
 

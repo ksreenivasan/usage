@@ -85,6 +85,20 @@ _LOCK_CONTENDED_ERRNOS = frozenset(
 PREFERENCES_FILE = os.path.expanduser("~/.claude/usage-preferences.json")
 CONTEXT_BURN_FILE = os.path.expanduser("~/.claude/usage-context-burn.json")
 MIX_DIR = os.path.expanduser("~/.usage/claude-pane/mix")
+# Fork: claude-personal runs this script with HOME set here, which keeps each account's
+# quota in its own status file. See FORK.md.
+PERSONAL_HOME = os.path.join(".claude-personal", "statusline-home")
+
+
+def _account_view(home: str) -> Tuple[str, str, str]:
+    """Return this account's label, the other account's label and its status file."""
+    status_file = os.path.join(".claude", "usage-status.json")
+    if home.endswith(os.sep + PERSONAL_HOME):
+        return "personal", "work", os.path.join(home[: -len(PERSONAL_HOME)], status_file)
+    return "work", "personal", os.path.join(home, PERSONAL_HOME, status_file)
+
+
+ACTIVE_ACCOUNT, OTHER_ACCOUNT, OTHER_STATUS_FILE = _account_view(os.path.expanduser("~"))
 # Bytes one status-line run may parse; a long transcript catches up over
 # several refreshes instead of stalling one.
 MIX_READ_BUDGET = 4 * 1024 * 1024
@@ -329,6 +343,8 @@ C = {
 }
 # A separator only marks a break; it should not compete with the numbers.
 SEP = f" {C['grey']}|{C['reset']} "
+WINDOW_SEP = f" {C['grey']}·{C['reset']} "
+ACCOUNT_HIGHLIGHT = "\033[1;7m"
 
 
 def _windows_system_lang() -> str:
@@ -1025,6 +1041,56 @@ def read_mix(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 os.unlink(temporary)
 
 
+def _other_account_parts(now: datetime, bar_w: int) -> List[Tuple[str, str, str]]:
+    """Dimmed quota windows of the account not running here, widest form first."""
+    try:
+        with open(OTHER_STATUS_FILE, encoding="utf-8") as f:
+            rate_limits = _as_dict(_as_dict(json.load(f)).get("rate_limits"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return []
+    parts: List[Tuple[str, str, str]] = []
+    for key, label in (("five_hour", _t("five_hour")), ("seven_day", _t("seven_day"))):
+        entry = _as_dict(rate_limits.get(key))
+        pct = _as_float(entry.get("used_percentage"))
+        if pct is None:
+            continue
+        reset = ""
+        resets_at = _as_float(entry.get("resets_at"))
+        if resets_at is not None:
+            remain = int(resets_at) - int(now.timestamp())
+            if remain > 0:
+                left = f"{fmt_duration(remain)} {_t('remaining_prefix')}"
+                reset = f" {C['dim']}{left}{C['reset']}"
+            else:
+                pct = 0.0
+        name = f"{C['dim']}{label}:{C['reset']}"
+        bar = progress_bar(pct, bar_w, color_func=lambda _pct: C["dim"])
+        parts.append(
+            (f"{name}{bar}{reset}", f"{name}{bar}", f"{name}{C['dim']}{pct:.0f}%{C['reset']}")
+        )
+    return parts
+
+
+def _two_account_line(
+    base: List[str],
+    active: List[Tuple[str, str, str]],
+    other: List[Tuple[str, str, str]],
+    width: int,
+) -> List[str]:
+    """Both accounts side by side in the widest form that fits; the active one is highlighted."""
+    highlighted = f"{ACCOUNT_HIGHLIGHT} {ACTIVE_ACCOUNT} {C['reset']}"
+    dimmed = f"{C['dim']}{OTHER_ACCOUNT}{C['reset']}"
+    line = base
+    for active_form, other_form in ((0, 0), (0, 1), (0, 2), (1, 2), (2, 2)):
+        ours = " ".join([highlighted, WINDOW_SEP.join(p[active_form] for p in active)]).rstrip()
+        theirs = " ".join([dimmed, WINDOW_SEP.join(p[other_form] for p in other)])
+        # Fixed sides, so only the highlight moves between sessions.
+        line = base + ([ours, theirs] if ACTIVE_ACCOUNT == "work" else [theirs, ours])
+        if vlen(SEP.join(line)) <= width:
+            break
+    return line
+
+
 def _render_core(data: Dict[str, Any], now: datetime) -> str:
     width = get_width()
     ctx = _as_dict(data.get("context_window"))
@@ -1112,6 +1178,10 @@ def _render_core(data: Dict[str, Any], now: datetime) -> str:
             )
             parts.append(_t("mix_tools").format(n=share))
             ctx_label_part = f"{ctx_parts[0]} · {C['dim']}{' · '.join(parts)}{C['reset']}"
+
+    other_parts = _other_account_parts(now, bar_w)
+    if other_parts:
+        line1, rl_parts = _two_account_line(line1, rl_parts, other_parts, width), []
 
     full = line1 + [p[0] for p in rl_parts]
     candidate = SEP.join(full)

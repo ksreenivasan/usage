@@ -10,6 +10,7 @@ import errno
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -1694,3 +1695,156 @@ def test_render_quota_countdown_variants(
         if width == 200:
             expected += suffix
     assert usage_statusline._render_core(payload, now) == expected
+
+
+# Fork: two accounts side by side.
+TWO_ACCOUNT_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+TWO_ACCOUNT_RESET = int(TWO_ACCOUNT_NOW.timestamp()) + 7200
+
+
+def _plain(text: str) -> str:
+    return re.sub(r"\033\[[0-9;]*m", "", text)
+
+
+def _two_account_payload() -> dict[str, Any]:
+    return {
+        "rate_limits": {
+            "five_hour": {"used_percentage": 40, "resets_at": TWO_ACCOUNT_RESET},
+            "seven_day": {"used_percentage": 38, "resets_at": TWO_ACCOUNT_RESET},
+        },
+    }
+
+
+def _seed_other_account(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    rate_limits: Any,
+    active: str = "work",
+    other: str = "personal",
+) -> None:
+    status_file = tmp_path / "other-status.json"
+    status_file.write_text(json.dumps({"rate_limits": rate_limits}), encoding="utf-8")
+    monkeypatch.setenv("TT_LANG", "en")
+    monkeypatch.setattr(usage_statusline, "get_width", lambda: 200)
+    monkeypatch.setattr(usage_statusline, "OTHER_STATUS_FILE", str(status_file))
+    monkeypatch.setattr(usage_statusline, "ACTIVE_ACCOUNT", active)
+    monkeypatch.setattr(usage_statusline, "OTHER_ACCOUNT", other)
+
+
+def test_account_view_from_each_home() -> None:
+    home = os.path.join(os.sep, "home", "me")
+    personal = os.path.join(home, usage_statusline.PERSONAL_HOME)
+    work_status = os.path.join(home, ".claude", "usage-status.json")
+    personal_status = os.path.join(personal, ".claude", "usage-status.json")
+
+    assert usage_statusline._account_view(home) == ("work", "personal", personal_status)
+    assert usage_statusline._account_view(personal) == ("personal", "work", work_status)
+
+
+def test_render_shows_both_accounts_and_highlights_the_active_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _seed_other_account(
+        monkeypatch,
+        tmp_path,
+        {"seven_day": {"used_percentage": 4, "resets_at": TWO_ACCOUNT_RESET}},
+    )
+
+    output = usage_statusline.render(_two_account_payload(), TWO_ACCOUNT_NOW)
+    first_line = output.splitlines()[0]
+
+    assert f"{usage_statusline.ACCOUNT_HIGHLIGHT} work " in first_line
+    assert f"{usage_statusline.C['dim']}personal" in first_line
+    plain = _plain(first_line)
+    assert plain.index("work") < plain.index("40%") < plain.index("personal") < plain.index("4%")
+    assert "personal 7d:" in plain
+
+
+def test_render_keeps_sides_fixed_when_personal_is_active(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _seed_other_account(
+        monkeypatch,
+        tmp_path,
+        {"five_hour": {"used_percentage": 100, "resets_at": TWO_ACCOUNT_RESET}},
+        active="personal",
+        other="work",
+    )
+    payload = {"rate_limits": {"seven_day": {"used_percentage": 4, "resets_at": TWO_ACCOUNT_RESET}}}
+
+    first_line = usage_statusline.render(payload, TWO_ACCOUNT_NOW).splitlines()[0]
+
+    assert f"{usage_statusline.ACCOUNT_HIGHLIGHT} personal " in first_line
+    plain = _plain(first_line)
+    assert plain.index("work") < plain.index("100%") < plain.index("personal") < plain.index("4%")
+
+
+def test_render_zeroes_the_other_accounts_expired_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    expired = int(TWO_ACCOUNT_NOW.timestamp()) - 60
+    _seed_other_account(
+        monkeypatch, tmp_path, {"five_hour": {"used_percentage": 73, "resets_at": expired}}
+    )
+
+    plain = _plain(usage_statusline.render(_two_account_payload(), TWO_ACCOUNT_NOW))
+
+    assert "personal 5h:" in plain
+    assert "73%" not in plain
+    assert "0%" in plain.split("personal", 1)[1]
+
+
+def test_render_keeps_active_label_before_its_first_reply(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _seed_other_account(
+        monkeypatch,
+        tmp_path,
+        {"seven_day": {"used_percentage": 4, "resets_at": TWO_ACCOUNT_RESET}},
+    )
+
+    plain = _plain(usage_statusline.render({}, TWO_ACCOUNT_NOW))
+
+    assert " work " in plain
+    assert "personal 7d:" in plain
+
+
+@pytest.mark.parametrize(
+    "other_file_text",
+    [None, "{not json", "[]", "{}", '{"rate_limits": {"seven_day": {"used_percentage": "bad"}}}'],
+)
+def test_render_is_single_account_without_usable_other_data(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, other_file_text: str | None
+) -> None:
+    monkeypatch.setenv("TT_LANG", "en")
+    monkeypatch.setattr(usage_statusline, "get_width", lambda: 200)
+    baseline = usage_statusline.render(_two_account_payload(), TWO_ACCOUNT_NOW)
+
+    other_file = tmp_path / "other-status.json"
+    if other_file_text is not None:
+        other_file.write_text(other_file_text, encoding="utf-8")
+    monkeypatch.setattr(usage_statusline, "OTHER_STATUS_FILE", str(other_file))
+
+    assert usage_statusline.render(_two_account_payload(), TWO_ACCOUNT_NOW) == baseline
+    assert "work" not in baseline
+
+
+@pytest.mark.parametrize("width", [150, 110, 90, 70, 58])
+def test_render_two_accounts_narrows_to_fit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, width: int
+) -> None:
+    _seed_other_account(
+        monkeypatch,
+        tmp_path,
+        {
+            "five_hour": {"used_percentage": 12, "resets_at": TWO_ACCOUNT_RESET},
+            "seven_day": {"used_percentage": 4, "resets_at": TWO_ACCOUNT_RESET},
+        },
+    )
+    monkeypatch.setattr(usage_statusline, "get_width", lambda: width)
+
+    first_line = usage_statusline.render(_two_account_payload(), TWO_ACCOUNT_NOW).splitlines()[0]
+
+    assert usage_statusline.vlen(first_line) <= width
+    assert "work" in first_line
+    assert "personal" in first_line
