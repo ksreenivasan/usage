@@ -1074,8 +1074,8 @@ def _other_account_parts(now: datetime, bar_w: int) -> List[Tuple[str, str, str]
                 pct = 0.0
         name = f"{INACTIVE_GREY}{label}:{C['reset']}"
         bar = progress_bar(pct, bar_w, color_func=lambda _pct: INACTIVE_GREY)
-        short_left = f" {left}" if left else ""
-        long_left = f"{short_left} {_t('remaining_prefix')}" if left else ""
+        short_left = f" ({left})" if left else ""
+        long_left = f" ({left} {_t('remaining_prefix')})" if left else ""
         plain = f"{pct:.0f}%"
         parts.append(
             (
@@ -1109,8 +1109,7 @@ def _two_account_line(
         ours = " ".join([active_name, WINDOW_SEP.join(p[active_form] for p in active)])
         ours = _on_fill(ours.rstrip())
         theirs = " ".join([other_name, WINDOW_SEP.join(p[other_form] for p in other)])
-        # Fixed sides, so only the highlight moves between sessions.
-        line = base + ([ours, theirs] if ACTIVE_ACCOUNT == "work" else [theirs, ours])
+        line = base + [ours, theirs]
         if vlen(SEP.join(line)) <= width:
             break
     return line

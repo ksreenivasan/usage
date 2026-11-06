@@ -1760,7 +1760,7 @@ def test_render_shows_both_accounts_and_highlights_the_active_one(
     assert "personal 7d:" in plain
 
 
-def test_render_keeps_sides_fixed_when_personal_is_active(
+def test_render_puts_personal_first_when_it_is_active(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _seed_other_account(
@@ -1776,7 +1776,7 @@ def test_render_keeps_sides_fixed_when_personal_is_active(
 
     assert f"{usage_statusline.ACTIVE_FILL} \033[1mpersonal" in first_line
     plain = _plain(first_line)
-    assert plain.index("work") < plain.index("100%") < plain.index("personal") < plain.index("4%")
+    assert plain.index("personal") < plain.index("4%") < plain.index("work") < plain.index("100%")
 
 
 def test_render_zeroes_the_other_accounts_expired_window(
@@ -1879,7 +1879,7 @@ def test_other_account_block_uses_only_grey(
         assert set(re.findall(r"\033\[[0-9;]*m", form)) <= allowed
 
 
-@pytest.mark.parametrize("width", [150, 110, 90, 70, 62])
+@pytest.mark.parametrize("width", [150, 110, 90, 70, 64])
 def test_render_two_accounts_narrows_to_fit(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, width: int
 ) -> None:
@@ -1898,4 +1898,4 @@ def test_render_two_accounts_narrows_to_fit(
     assert usage_statusline.vlen(first_line) <= width
     assert "work" in first_line
     other_block = _plain(first_line).split("personal", 1)[1]
-    assert other_block.count("2h0m") == 2
+    assert other_block.count("(2h0m") == 2

@@ -21,8 +21,8 @@ render (`read_mix`: up to 4 MiB, cached under `~/.usage/claude-pane/mix/`).
   unused, to keep merges small.
 - `git_branch()` now reads `.git` and `HEAD` only if they are regular files, and at most 4 KiB. Before this, a
   FIFO or a symlink to `/dev/zero` in the working directory could hang the render or exhaust its memory.
-- Shows both accounts side by side, `work` then `personal`, the active one on a lighter fill and the other in
-  grey, told apart by brightness rather than hue. The inactive side always shows its time to reset. `claude-personal`
+- Shows both accounts side by side: the active one first on a lighter fill, the other in grey, told apart by
+  brightness rather than hue. The inactive side always shows its time to reset. `claude-personal`
   already runs this script with `HOME=~/.claude-personal/statusline-home` (from its `overrides.json`), so each
   account writes its own `usage-status.json`. The script tells which account it is from `HOME` and reads the
   other account's file. That is the only file it reads from outside its `HOME`. With no such file it renders one
