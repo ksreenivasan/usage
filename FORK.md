@@ -5,14 +5,14 @@ status line, `usage_hooks/usage_statusline.py` (at the repo root before v0.32). 
 
 ## Branches
 
-- `ks-main`: upstream tag `v0.34.7` plus the changes below. It is the default branch, and we install from it.
+- `ks-main`: upstream tag `v0.34.13` plus the changes below. It is the default branch, and we install from it.
 - `upstream-main`: an untouched copy of upstream `main` from fork time (2026-10-27), renamed from `main` so it
   isn't mistaken for ours. It has not been reviewed, so never install from it.
 
 ## What we changed
 
 The base was v0.31.4, which a static audit on 2026-10-27 found to be clean: no telemetry, no credential reads,
-and no network or subprocess calls in the status line. Upstream v0.34.7 was reviewed the same day and merged.
+and no network or subprocess calls in the status line. Upstream v0.34.7 was reviewed the same day and merged, and v0.34.13 on 2026-11-05.
 The status line still makes no network or subprocess calls. It now parses the session transcript on each
 render (`read_mix`: up to 4 MiB, cached under `~/.usage/claude-pane/mix/`).
 
@@ -46,8 +46,8 @@ Upstream releases often, several times a day at times. Pull only what you have r
 
 ```bash
 git fetch upstream --tags
-git diff v0.34.7 vX.Y.Z -- usage_hooks/usage_statusline.py   # what we run
-git log --oneline v0.34.7..vX.Y.Z                                                # everything else
+git diff v0.34.13 vX.Y.Z -- usage_hooks/usage_statusline.py   # what we run
+git log --oneline v0.34.13..vX.Y.Z                                                # everything else
 ```
 
 1. Review the diff of the status line script, `usage_hooks/usage_statusline.py`.
